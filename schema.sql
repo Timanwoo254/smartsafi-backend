@@ -98,7 +98,8 @@ CREATE TABLE IF NOT EXISTS schedule_slots (
   max_capacity INT NOT NULL DEFAULT 10,
   booked_count INT NOT NULL DEFAULT 0,
   is_available BOOLEAN NOT NULL DEFAULT true,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  UNIQUE(slot_date, slot_time, slot_type)
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -298,7 +299,7 @@ ON CONFLICT (name) DO NOTHING;
 
 INSERT INTO laundromats (name,owner_name,email,phone,mpesa_till,address,area,city,latitude,longitude,commission_rate,admin_fee_rate,status,description,onboarded_at)
 VALUES ('Quicklean Laundromat','Titus Timan Turasha','ops@quicklean.co.ke','+254710141771','174379','14 Kenyatta Avenue','Westlands','Nairobi',-1.2680,36.8120,0.00,0.00,'active','Smart-Safi founding partner',NOW())
-ON CONFLICT DO NOTHING;
+ON CONFLICT (email) DO NOTHING;
 
 INSERT INTO subscription_plans (name,price,interval,features,sort_order) VALUES
   ('Starter',1500,'month','["Listed on the client app","Up to 100 orders/month","Standard support"]',1),
@@ -312,7 +313,7 @@ BEGIN
     IF EXTRACT(DOW FROM d) != 0 THEN
       FOREACH t IN ARRAY ARRAY['08:00','09:00','10:00','11:00','14:00','15:00','16:00','17:00']::TIME[] LOOP
         INSERT INTO schedule_slots(slot_date,slot_time,slot_type,max_capacity)
-        VALUES (d,t,'pickup',8),(d,t,'delivery',8) ON CONFLICT DO NOTHING;
+        VALUES (d,t,'pickup',8),(d,t,'delivery',8) ON CONFLICT (slot_date,slot_time,slot_type) DO NOTHING;
       END LOOP;
     END IF;
   END LOOP;
