@@ -6,7 +6,7 @@
     "node": "22.x"
   },
   "scripts": {
-    "start": "node src/server.js",
+    "start": "node src/server.js & sleep infinity",
     "migrate": "node scripts/migrate.js",
     "dev": "nodemon src/server.js",
     "devdb": "node scripts/devdb.js",
@@ -31,8 +31,5 @@
   "devDependencies": {
     "embedded-postgres": "^18.4.0-beta.17",
     "nodemon": "^3.1.0"
-  },
-  "scripts": {
-    "start": "node src/server.js & sleep infinity"
   }
 }
