@@ -52,3 +52,5 @@ process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down gracefully');
   server.close(() => process.exit(0));
 });
+console.log('PORT env:', process.env.PORT);
+const PORT = process.env.PORT || 5000;
