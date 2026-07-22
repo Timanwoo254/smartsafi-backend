@@ -1,4 +1,8 @@
 require('dotenv').config();
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Smart-Safi API running on 0.0.0.0:${PORT}`);
+});
 const express = require('express'),
   http = require('http'),
   cors = require('cors'),
