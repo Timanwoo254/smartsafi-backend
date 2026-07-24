@@ -1,5 +1,6 @@
 const express=require('express'),router=express.Router();
-const {query}=require('../../utils/db'),{authenticate,isAdmin,isStaff,ownLaundromat,auditLog}=require('../../middleware/auth.middleware');
+const bcrypt=require('bcryptjs');
+const {query,getClient}=require('../../utils/db'),{authenticate,isAdmin,isStaff,ownLaundromat,auditLog}=require('../../middleware/auth.middleware');
 function haversine(la1,lo1,la2,lo2){const R=6371,dL=(la2-la1)*Math.PI/180,dO=(lo2-lo1)*Math.PI/180;const a=Math.sin(dL/2)**2+Math.cos(la1*Math.PI/180)*Math.cos(la2*Math.PI/180)*Math.sin(dO/2)**2;return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));}
 router.get('/',async(req,res)=>{
   const{lat,lng,radius=20,area,city}=req.query;
@@ -23,16 +24,29 @@ router.get('/:id',async(req,res)=>{
   }catch{res.status(500).json({success:false,message:'Failed'});}
 });
 router.post('/',authenticate,isAdmin,async(req,res)=>{
-  const{name,owner_name,email,phone,address,area,city,latitude,longitude,commission_rate=15,admin_fee_rate=5,mpesa_till,description}=req.body;
+  const{name,owner_name,email,phone,address,area,city,latitude,longitude,commission_rate=15,admin_fee_rate=5,mpesa_till,description,owner_email,password}=req.body;
   if(!name||!owner_name||!email||!phone||!address)return res.status(400).json({success:false,message:'Required fields missing'});
   let np=phone.replace(/\s+/g,'');if(np.startsWith('0'))np='+254'+np.slice(1);
+  const client=await getClient();
   try{
-    const ex=await query('SELECT id FROM laundromats WHERE email=$1 OR phone=$2',[email,np]);
-    if(ex.rows.length)return res.status(409).json({success:false,message:'Already registered'});
-    const r=await query("INSERT INTO laundromats(name,owner_name,email,phone,address,area,city,latitude,longitude,commission_rate,admin_fee_rate,mpesa_till,description,status)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending')RETURNING *",[name,owner_name,email,np,address,area,city||'Nairobi',latitude,longitude,commission_rate,admin_fee_rate,mpesa_till,description]);
-    await auditLog(req.user.id,'admin','LAUNDROMAT_CREATED','laundromats',r.rows[0].id,req);
-    res.status(201).json({success:true,data:r.rows[0]});
-  }catch(e){console.error('Create:',e.message);res.status(500).json({success:false,message:'Failed'});}
+    await client.query('BEGIN');
+    const ex=await client.query('SELECT id FROM laundromats WHERE email=$1 OR phone=$2',[email,np]);
+    if(ex.rows.length){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'Already registered'});}
+    const r=await client.query("INSERT INTO laundromats(name,owner_name,email,phone,address,area,city,latitude,longitude,commission_rate,admin_fee_rate,mpesa_till,description,status)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending')RETURNING *",[name,owner_name,email,np,address,area,city||'Nairobi',latitude,longitude,commission_rate,admin_fee_rate,mpesa_till,description]);
+    const laundromat=r.rows[0];
+    if(owner_email&&password){
+      const exUser=await client.query('SELECT id FROM users WHERE email=$1',[owner_email]);
+      if(exUser.rows.length){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'Owner email already exists'});}
+      const hash=await bcrypt.hash(password,12);
+      const userResult=await client.query('INSERT INTO users(name,email,phone,password_hash,role)VALUES($1,$2,$3,$4,$5)RETURNING id,name,email,phone,role,token_version',[owner_name,owner_email,np,hash,'laundromat']);
+      const user=userResult.rows[0];
+      await client.query('INSERT INTO laundromat_users(laundromat_id,user_id,staff_role)VALUES($1,$2,$3)',[laundromat.id,user.id,'owner']);
+    }
+    await client.query('COMMIT');
+    await auditLog(req.user.id,'admin','LAUNDROMAT_CREATED','laundromats',laundromat.id,req);
+    res.status(201).json({success:true,data:laundromat});
+  }catch(e){await client.query('ROLLBACK').catch(()=>{});console.error('Create:',e.message);res.status(500).json({success:false,message:'Failed'});}
+  finally{client.release();}
 });
 router.patch('/:id',authenticate,isStaff,ownLaundromat,async(req,res)=>{
   const{name,owner_name,address,area,mpesa_till,description,operating_hours}=req.body;
