@@ -25,7 +25,7 @@ router.get('/:id',async(req,res)=>{
 });
 router.post('/',authenticate,isAdmin,async(req,res)=>{
   const{name,owner_name,email,phone,address,area,city,latitude,longitude,commission_rate=15,admin_fee_rate=5,mpesa_till,description,owner_email,password}=req.body;
-  if(!name||!owner_name||!email||!phone||!address)return res.status(400).json({success:false,message:'Required fields missing'});
+  if(!name||!owner_name||!email||!phone||!address||!owner_email||!password)return res.status(400).json({success:false,message:'Required fields missing: name, owner_name, email, phone, address, owner_email, and password are required'});
   let np=phone.replace(/\s+/g,'');if(np.startsWith('0'))np='+254'+np.slice(1);
   const client=await getClient();
   try{
@@ -34,17 +34,15 @@ router.post('/',authenticate,isAdmin,async(req,res)=>{
     if(ex.rows.length){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'Already registered'});}
     const r=await client.query("INSERT INTO laundromats(name,owner_name,email,phone,address,area,city,latitude,longitude,commission_rate,admin_fee_rate,mpesa_till,description,status)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending')RETURNING *",[name,owner_name,email,np,address,area,city||'Nairobi',latitude,longitude,commission_rate,admin_fee_rate,mpesa_till,description]);
     const laundromat=r.rows[0];
-    if(owner_email&&password){
-      const exUser=await client.query('SELECT id FROM users WHERE email=$1',[owner_email]);
-      if(exUser.rows.length){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'Owner email already exists'});}
-      const hash=await bcrypt.hash(password,12);
-      const userResult=await client.query('INSERT INTO users(name,email,phone,password_hash,role)VALUES($1,$2,$3,$4,$5)RETURNING id,name,email,phone,role,token_version',[owner_name,owner_email,np,hash,'laundromat']);
-      const user=userResult.rows[0];
-      await client.query('INSERT INTO laundromat_users(laundromat_id,user_id,staff_role)VALUES($1,$2,$3)',[laundromat.id,user.id,'owner']);
-    }
+    const exUser=await client.query('SELECT id FROM users WHERE email=$1 OR phone=$2',[owner_email,np]);
+    if(exUser.rows.length){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'Owner email or phone already exists'});}
+    const hash=await bcrypt.hash(password,12);
+    const userResult=await client.query('INSERT INTO users(name,email,phone,password_hash,role)VALUES($1,$2,$3,$4,$5)RETURNING id,name,email,phone,role,token_version',[owner_name,owner_email,np,hash,'laundromat']);
+    const user=userResult.rows[0];
+    await client.query('INSERT INTO laundromat_users(laundromat_id,user_id,staff_role)VALUES($1,$2,$3)',[laundromat.id,user.id,'owner']);
     await client.query('COMMIT');
     await auditLog(req.user.id,'admin','LAUNDROMAT_CREATED','laundromats',laundromat.id,req);
-    res.status(201).json({success:true,data:laundromat});
+    res.status(201).json({success:true,data:{...laundromat,owner_email,owner_user_id:user.id}});
   }catch(e){await client.query('ROLLBACK').catch(()=>{});console.error('Create:',e.message);res.status(500).json({success:false,message:'Failed'});}
   finally{client.release();}
 });
