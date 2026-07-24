@@ -37,7 +37,7 @@ router.post('/',authenticate,isAdmin,async(req,res)=>{
     const exUser=await client.query('SELECT id FROM users WHERE email=$1 OR phone=$2',[owner_email,np]);
     if(exUser.rows.length){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'Owner email or phone already exists'});}
     const hash=await bcrypt.hash(password,12);
-    const userResult=await client.query('INSERT INTO users(name,email,phone,password_hash,role)VALUES($1,$2,$3,$4,$5)RETURNING id,name,email,phone,role,token_version',[owner_name,owner_email,np,hash,'laundromat']);
+    const userResult=await client.query('INSERT INTO users(name,email,phone,password_hash,role,is_active)VALUES($1,$2,$3,$4,$5,$6)RETURNING id,name,email,phone,role,token_version',[owner_name,owner_email,np,hash,'laundromat',true]);
     const user=userResult.rows[0];
     await client.query('INSERT INTO laundromat_users(laundromat_id,user_id,staff_role)VALUES($1,$2,$3)',[laundromat.id,user.id,'owner']);
     await client.query('COMMIT');
@@ -69,7 +69,7 @@ router.post('/:id/staff',authenticate,isAdmin,async(req,res)=>{
   const{user_id,staff_role='staff'}=req.body;
   try{
     await query('INSERT INTO laundromat_users(laundromat_id,user_id,staff_role)VALUES($1,$2,$3)ON CONFLICT(laundromat_id,user_id)DO UPDATE SET staff_role=$3,is_active=true',[req.params.id,user_id,staff_role]);
-    await query("UPDATE users SET role='laundromat',updated_at=NOW() WHERE id=$1",[user_id]);
+    await query("UPDATE users SET role='laundromat',is_active=true,updated_at=NOW() WHERE id=$1",[user_id]);
     res.status(201).json({success:true,message:'Staff added'});
   }catch{res.status(500).json({success:false,message:'Failed'});}
 });
