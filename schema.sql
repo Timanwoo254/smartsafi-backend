@@ -32,8 +32,24 @@ CREATE TABLE IF NOT EXISTS addresses (
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS laundromat_groups (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  name VARCHAR(150) NOT NULL,
+  business_email VARCHAR(150) UNIQUE,
+  business_phone VARCHAR(20),
+  mpesa_till VARCHAR(30),
+  commission_rate DECIMAL(5,2) NOT NULL DEFAULT 15.00,
+  admin_fee_rate DECIMAL(5,2) NOT NULL DEFAULT 5.00,
+  status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('pending','active','suspended','rejected')),
+  logo_url TEXT,
+  description TEXT,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS laundromats (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  group_id UUID REFERENCES laundromat_groups(id) ON DELETE SET NULL,
   name VARCHAR(150) NOT NULL,
   owner_name VARCHAR(100) NOT NULL,
   email VARCHAR(150) UNIQUE NOT NULL,
@@ -53,18 +69,32 @@ CREATE TABLE IF NOT EXISTS laundromats (
   description TEXT,
   operating_hours JSONB,
   onboarded_at TIMESTAMP,
+  is_main_branch BOOLEAN NOT NULL DEFAULT false,
   created_at TIMESTAMP NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS laundromat_users (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  laundromat_id UUID NOT NULL REFERENCES laundromats(id) ON DELETE CASCADE,
+  group_id UUID REFERENCES laundromat_groups(id) ON DELETE CASCADE,
+  laundromat_id UUID REFERENCES laundromats(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   staff_role VARCHAR(20) NOT NULL DEFAULT 'staff' CHECK (staff_role IN ('owner','manager','staff')),
   is_active BOOLEAN NOT NULL DEFAULT true,
+  can_access_all_branches BOOLEAN NOT NULL DEFAULT false,
   created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  UNIQUE(group_id, laundromat_id, user_id),
   UNIQUE(laundromat_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS group_user_roles (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  group_id UUID NOT NULL REFERENCES laundromat_groups(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  role VARCHAR(20) NOT NULL DEFAULT 'manager' CHECK (role IN ('owner','manager','staff','admin')),
+  is_active BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  UNIQUE(group_id, user_id)
 );
 
 CREATE TABLE IF NOT EXISTS services (
@@ -164,6 +194,7 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE TABLE IF NOT EXISTS disbursements (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   order_id UUID NOT NULL REFERENCES orders(id),
+  group_id UUID REFERENCES laundromat_groups(id) ON DELETE SET NULL,
   laundromat_id UUID NOT NULL REFERENCES laundromats(id),
   gross_amount DECIMAL(10,2) NOT NULL,
   commission_rate DECIMAL(5,2) NOT NULL,
@@ -180,6 +211,7 @@ CREATE TABLE IF NOT EXISTS disbursements (
 
 CREATE TABLE IF NOT EXISTS admin_fee_invoices (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  group_id UUID REFERENCES laundromat_groups(id) ON DELETE SET NULL,
   laundromat_id UUID NOT NULL REFERENCES laundromats(id),
   billing_period VARCHAR(7) NOT NULL,
   monthly_gmv DECIMAL(10,2) NOT NULL,
@@ -207,6 +239,7 @@ CREATE TABLE IF NOT EXISTS subscription_plans (
 
 CREATE TABLE IF NOT EXISTS laundromat_subscriptions (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  group_id UUID REFERENCES laundromat_groups(id) ON DELETE CASCADE,
   laundromat_id UUID NOT NULL REFERENCES laundromats(id) ON DELETE CASCADE UNIQUE,
   plan_id UUID NOT NULL REFERENCES subscription_plans(id),
   status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','active','past_due','canceled')),
@@ -282,6 +315,11 @@ CREATE INDEX IF NOT EXISTS idx_disbursements_lm ON disbursements(laundromat_id);
 CREATE INDEX IF NOT EXISTS idx_disbursements_status ON disbursements(status);
 CREATE INDEX IF NOT EXISTS idx_admin_fees_lm ON admin_fee_invoices(laundromat_id);
 CREATE INDEX IF NOT EXISTS idx_payments_mpesa ON payments(mpesa_checkout_request_id);
+CREATE INDEX IF NOT EXISTS idx_laundromats_group ON laundromats(group_id);
+CREATE INDEX IF NOT EXISTS idx_laundromat_users_group ON laundromat_users(group_id);
+CREATE INDEX IF NOT EXISTS idx_laundromat_users_laundromat ON laundromat_users(laundromat_id);
+CREATE INDEX IF NOT EXISTS idx_group_user_roles_group ON group_user_roles(group_id);
+CREATE INDEX IF NOT EXISTS idx_group_user_roles_user ON group_user_roles(user_id);
 
 INSERT INTO services (name,description,price_per_unit,unit,category,sort_order) VALUES
   ('Dry Cleaning','Professional dry cleaning',350,'per item','standard',1),
@@ -297,8 +335,16 @@ INSERT INTO services (name,description,price_per_unit,unit,category,sort_order) 
   ('Fabric Conditioner','Long-lasting freshness',20,'per kg','special',11)
 ON CONFLICT (name) DO NOTHING;
 
-INSERT INTO laundromats (name,owner_name,email,phone,mpesa_till,address,area,city,latitude,longitude,commission_rate,admin_fee_rate,status,description,onboarded_at)
-VALUES ('Quicklean Laundromat','Titus Timan Turasha','ops@quicklean.co.ke','+254710141771','174379','14 Kenyatta Avenue','Westlands','Nairobi',-1.2680,36.8120,0.00,0.00,'active','Smart-Safi founding partner',NOW())
+-- Insert sample laundromat group for multi-branch support
+INSERT INTO laundromat_groups (name, business_email, business_phone, mpesa_till, commission_rate, admin_fee_rate, status, description)
+VALUES ('Quicklean Group','group@quicklean.co.ke','+254710141771','174379',15.00,5.00,'active','Smart-Safi founding partner group')
+ON CONFLICT (business_email) DO NOTHING;
+
+INSERT INTO laundromats (group_id, name, owner_name, email, phone, mpesa_till, address, area, city, latitude, longitude, commission_rate, admin_fee_rate, status, description, onboarded_at, is_main_branch)
+VALUES (
+  (SELECT id FROM laundromat_groups WHERE business_email='group@quicklean.co.ke' LIMIT 1),
+  'Quicklean Laundromat - Westlands','Titus Timan Turasha','ops@quicklean.co.ke','+254710141771','174379','14 Kenyatta Avenue','Westlands','Nairobi',-1.2680,36.8120,15.00,5.00,'active','Smart-Safi founding partner - Main Branch',NOW(),true
+)
 ON CONFLICT (email) DO NOTHING;
 
 INSERT INTO subscription_plans (name,price,interval,features,sort_order) VALUES
@@ -322,14 +368,14 @@ END $$;
 CREATE OR REPLACE FUNCTION generate_monthly_admin_fees(billing_month VARCHAR(7)) RETURNS INT AS $$
 DECLARE lm RECORD; monthly_gmv DECIMAL(10,2); fee_amount DECIMAL(10,2); count_created INT := 0;
 BEGIN
-  FOR lm IN SELECT id,admin_fee_rate FROM laundromats WHERE status='active' AND admin_fee_rate > 0 LOOP
+  FOR lm IN SELECT id,group_id,admin_fee_rate FROM laundromats WHERE status='active' AND admin_fee_rate > 0 LOOP
     SELECT COALESCE(SUM(o.subtotal),0) INTO monthly_gmv FROM orders o
     JOIN disbursements d ON d.order_id=o.id
     WHERE o.laundromat_id=lm.id AND TO_CHAR(o.created_at,'YYYY-MM')=billing_month AND o.status='delivered';
     IF monthly_gmv > 0 THEN
       fee_amount := ROUND(monthly_gmv * lm.admin_fee_rate / 100, 2);
-      INSERT INTO admin_fee_invoices (laundromat_id,billing_period,monthly_gmv,admin_fee_rate,admin_fee_amount,due_date)
-      VALUES (lm.id,billing_month,monthly_gmv,lm.admin_fee_rate,fee_amount,(TO_DATE(billing_month||'-01','YYYY-MM-DD')+INTERVAL '1 month + 5 days')::DATE)
+      INSERT INTO admin_fee_invoices (group_id, laundromat_id,billing_period,monthly_gmv,admin_fee_rate,admin_fee_amount,due_date)
+      VALUES (lm.group_id, lm.id,billing_month,monthly_gmv,lm.admin_fee_rate,fee_amount,(TO_DATE(billing_month||'-01','YYYY-MM-DD')+INTERVAL '1 month + 5 days')::DATE)
       ON CONFLICT (laundromat_id,billing_period) DO NOTHING;
       count_created := count_created + 1;
     END IF;
