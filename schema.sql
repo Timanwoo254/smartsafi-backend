@@ -49,7 +49,6 @@ CREATE TABLE IF NOT EXISTS laundromat_groups (
 
 CREATE TABLE IF NOT EXISTS laundromats (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  group_id UUID REFERENCES laundromat_groups(id) ON DELETE SET NULL,
   name VARCHAR(150) NOT NULL,
   owner_name VARCHAR(100) NOT NULL,
   email VARCHAR(150) UNIQUE NOT NULL,
@@ -69,32 +68,27 @@ CREATE TABLE IF NOT EXISTS laundromats (
   description TEXT,
   operating_hours JSONB,
   onboarded_at TIMESTAMP,
-  is_main_branch BOOLEAN NOT NULL DEFAULT false,
   created_at TIMESTAMP NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS laundromat_users (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  group_id UUID REFERENCES laundromat_groups(id) ON DELETE CASCADE,
-  laundromat_id UUID REFERENCES laundromats(id) ON DELETE CASCADE,
+  laundromat_id UUID NOT NULL REFERENCES laundromats(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   staff_role VARCHAR(20) NOT NULL DEFAULT 'staff' CHECK (staff_role IN ('owner','manager','staff')),
   is_active BOOLEAN NOT NULL DEFAULT true,
-  can_access_all_branches BOOLEAN NOT NULL DEFAULT false,
   created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  UNIQUE(group_id, laundromat_id, user_id),
   UNIQUE(laundromat_id, user_id)
 );
 
 CREATE TABLE IF NOT EXISTS group_user_roles (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  group_id UUID NOT NULL REFERENCES laundromat_groups(id) ON DELETE CASCADE,
+  group_id UUID NOT NULL,
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   role VARCHAR(20) NOT NULL DEFAULT 'manager' CHECK (role IN ('owner','manager','staff','admin')),
   is_active BOOLEAN NOT NULL DEFAULT true,
-  created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-  UNIQUE(group_id, user_id)
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS services (
@@ -194,7 +188,7 @@ CREATE TABLE IF NOT EXISTS payments (
 CREATE TABLE IF NOT EXISTS disbursements (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   order_id UUID NOT NULL REFERENCES orders(id),
-  group_id UUID REFERENCES laundromat_groups(id) ON DELETE SET NULL,
+  group_id UUID,
   laundromat_id UUID NOT NULL REFERENCES laundromats(id),
   gross_amount DECIMAL(10,2) NOT NULL,
   commission_rate DECIMAL(5,2) NOT NULL,
@@ -211,7 +205,7 @@ CREATE TABLE IF NOT EXISTS disbursements (
 
 CREATE TABLE IF NOT EXISTS admin_fee_invoices (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  group_id UUID REFERENCES laundromat_groups(id) ON DELETE SET NULL,
+  group_id UUID,
   laundromat_id UUID NOT NULL REFERENCES laundromats(id),
   billing_period VARCHAR(7) NOT NULL,
   monthly_gmv DECIMAL(10,2) NOT NULL,
@@ -239,7 +233,7 @@ CREATE TABLE IF NOT EXISTS subscription_plans (
 
 CREATE TABLE IF NOT EXISTS laundromat_subscriptions (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  group_id UUID REFERENCES laundromat_groups(id) ON DELETE CASCADE,
+  group_id UUID,
   laundromat_id UUID NOT NULL REFERENCES laundromats(id) ON DELETE CASCADE UNIQUE,
   plan_id UUID NOT NULL REFERENCES subscription_plans(id),
   status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','active','past_due','canceled')),
@@ -329,7 +323,7 @@ CREATE INDEX IF NOT EXISTS idx_group_user_roles_user ON group_user_roles(user_id
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'laundromats' AND column_name = 'group_id') THEN
-    ALTER TABLE laundromats ADD COLUMN group_id UUID REFERENCES laundromat_groups(id) ON DELETE SET NULL;
+    ALTER TABLE laundromats ADD COLUMN group_id UUID;
   END IF;
 END $$;
 
@@ -345,7 +339,7 @@ END $$;
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'laundromat_users' AND column_name = 'group_id') THEN
-    ALTER TABLE laundromat_users ADD COLUMN group_id UUID REFERENCES laundromat_groups(id) ON DELETE CASCADE;
+    ALTER TABLE laundromat_users ADD COLUMN group_id UUID;
   END IF;
 END $$;
 
@@ -369,7 +363,7 @@ END $$;
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'admin_fee_invoices' AND column_name = 'group_id') THEN
-    ALTER TABLE admin_fee_invoices ADD COLUMN group_id UUID REFERENCES laundromat_groups(id) ON DELETE SET NULL;
+    ALTER TABLE admin_fee_invoices ADD COLUMN group_id UUID;
   END IF;
 END $$;
 
@@ -377,7 +371,7 @@ END $$;
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'disbursements' AND column_name = 'group_id') THEN
-    ALTER TABLE disbursements ADD COLUMN group_id UUID REFERENCES laundromat_groups(id) ON DELETE SET NULL;
+    ALTER TABLE disbursements ADD COLUMN group_id UUID;
   END IF;
 END $$;
 
@@ -385,7 +379,7 @@ END $$;
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'laundromat_subscriptions' AND column_name = 'group_id') THEN
-    ALTER TABLE laundromat_subscriptions ADD COLUMN group_id UUID REFERENCES laundromat_groups(id) ON DELETE CASCADE;
+    ALTER TABLE laundromat_subscriptions ADD COLUMN group_id UUID;
   END IF;
 END $$;
 
@@ -408,6 +402,145 @@ BEGIN
   RETURN count_created;
 END;
 $$ LANGUAGE plpgsql;
+
+-- ============================================
+-- Add foreign key constraints for multi-branch columns
+-- ============================================
+
+-- Add foreign key for laundromats.group_id
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints 
+    WHERE constraint_type = 'FOREIGN KEY' AND table_name = 'laundromats' 
+    AND constraint_name = 'fk_laundromats_group_id'
+  ) THEN
+    ALTER TABLE laundromats 
+    ADD CONSTRAINT fk_laundromats_group_id 
+    FOREIGN KEY (group_id) REFERENCES laundromat_groups(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+-- Add foreign key for laundromat_users.group_id
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints 
+    WHERE constraint_type = 'FOREIGN KEY' AND table_name = 'laundromat_users' 
+    AND constraint_name = 'fk_laundromat_users_group_id'
+  ) THEN
+    ALTER TABLE laundromat_users 
+    ADD CONSTRAINT fk_laundromat_users_group_id 
+    FOREIGN KEY (group_id) REFERENCES laundromat_groups(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+-- Add foreign key for group_user_roles.group_id
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints 
+    WHERE constraint_type = 'FOREIGN KEY' AND table_name = 'group_user_roles' 
+    AND constraint_name = 'fk_group_user_roles_group_id'
+  ) THEN
+    ALTER TABLE group_user_roles 
+    ADD CONSTRAINT fk_group_user_roles_group_id 
+    FOREIGN KEY (group_id) REFERENCES laundromat_groups(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+-- Add foreign key for disbursements.group_id
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints 
+    WHERE constraint_type = 'FOREIGN KEY' AND table_name = 'disbursements' 
+    AND constraint_name = 'fk_disbursements_group_id'
+  ) THEN
+    ALTER TABLE disbursements 
+    ADD CONSTRAINT fk_disbursements_group_id 
+    FOREIGN KEY (group_id) REFERENCES laundromat_groups(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+-- Add foreign key for admin_fee_invoices.group_id
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints 
+    WHERE constraint_type = 'FOREIGN KEY' AND table_name = 'admin_fee_invoices' 
+    AND constraint_name = 'fk_admin_fee_invoices_group_id'
+  ) THEN
+    ALTER TABLE admin_fee_invoices 
+    ADD CONSTRAINT fk_admin_fee_invoices_group_id 
+    FOREIGN KEY (group_id) REFERENCES laundromat_groups(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+-- Add foreign key for laundromat_subscriptions.group_id
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints 
+    WHERE constraint_type = 'FOREIGN KEY' AND table_name = 'laundromat_subscriptions' 
+    AND constraint_name = 'fk_laundromat_subscriptions_group_id'
+  ) THEN
+    ALTER TABLE laundromat_subscriptions 
+    ADD CONSTRAINT fk_laundromat_subscriptions_group_id 
+    FOREIGN KEY (group_id) REFERENCES laundromat_groups(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+-- Add unique constraint for laundromat_users (group_id, laundromat_id, user_id)
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints 
+    WHERE constraint_type = 'UNIQUE' AND table_name = 'laundromat_users' 
+    AND constraint_name = 'uniq_laundromat_users_group_laundromat_user'
+  ) THEN
+    ALTER TABLE laundromat_users 
+    ADD CONSTRAINT uniq_laundromat_users_group_laundromat_user 
+    UNIQUE (group_id, laundromat_id, user_id);
+  END IF;
+END $$;
+
+-- Update unique constraint for laundromat_users (laundromat_id, user_id) to allow NULL laundromat_id
+DO $$
+BEGIN
+  -- Drop the old constraint if it exists and doesn't allow NULL
+  IF EXISTS (
+    SELECT 1 FROM information_schema.table_constraints 
+    WHERE constraint_type = 'UNIQUE' AND table_name = 'laundromat_users' 
+    AND constraint_name = 'laundromat_users_laundromat_id_user_id_key'
+  ) THEN
+    ALTER TABLE laundromat_users DROP CONSTRAINT laundromat_users_laundromat_id_user_id_key;
+  END IF;
+  
+  -- Create new constraint that allows NULL laundromat_id
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints 
+    WHERE constraint_type = 'UNIQUE' AND table_name = 'laundromat_users' 
+    AND constraint_name = 'uniq_laundromat_users_laundromat_user'
+  ) THEN
+    CREATE UNIQUE INDEX uniq_laundromat_users_laundromat_user 
+    ON laundromat_users(laundromat_id, user_id) WHERE laundromat_id IS NOT NULL;
+  END IF;
+END $$;
+
+-- Add unique constraint for group_user_roles (group_id, user_id)
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints 
+    WHERE constraint_type = 'UNIQUE' AND table_name = 'group_user_roles' 
+    AND constraint_name = 'uniq_group_user_roles_group_user'
+  ) THEN
+    ALTER TABLE group_user_roles 
+    ADD CONSTRAINT uniq_group_user_roles_group_user 
+    UNIQUE (group_id, user_id);
+  END IF;
+END $$;
 
 INSERT INTO services (name,description,price_per_unit,unit,category,sort_order) VALUES
   ('Dry Cleaning','Professional dry cleaning',350,'per item','standard',1),
