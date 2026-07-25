@@ -503,7 +503,7 @@ END $$;
 -- Update unique constraint for laundromat_users (laundromat_id, user_id) to allow NULL laundromat_id
 DO $$
 BEGIN
-  -- Drop the old constraint if it exists and doesn't allow NULL
+  -- Drop the old unique constraint if it exists (doesn't allow NULL)
   IF EXISTS (
     SELECT 1 FROM information_schema.table_constraints 
     WHERE constraint_type = 'UNIQUE' AND table_name = 'laundromat_users' 
@@ -512,12 +512,12 @@ BEGIN
     ALTER TABLE laundromat_users DROP CONSTRAINT laundromat_users_laundromat_id_user_id_key;
   END IF;
   
-  -- Create new constraint that allows NULL laundromat_id
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.table_constraints 
-    WHERE constraint_type = 'UNIQUE' AND table_name = 'laundromat_users' 
-    AND constraint_name = 'uniq_laundromat_users_laundromat_user'
-  ) THEN
+  -- Check if the partial unique index already exists
+  PERFORM 1 FROM pg_indexes 
+  WHERE tablename = 'laundromat_users' AND indexname = 'uniq_laundromat_users_laundromat_user';
+  
+  -- Only create if it doesn't exist
+  IF NOT FOUND THEN
     CREATE UNIQUE INDEX uniq_laundromat_users_laundromat_user 
     ON laundromat_users(laundromat_id, user_id) WHERE laundromat_id IS NOT NULL;
   END IF;
