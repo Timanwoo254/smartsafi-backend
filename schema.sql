@@ -321,6 +321,94 @@ CREATE INDEX IF NOT EXISTS idx_laundromat_users_laundromat ON laundromat_users(l
 CREATE INDEX IF NOT EXISTS idx_group_user_roles_group ON group_user_roles(group_id);
 CREATE INDEX IF NOT EXISTS idx_group_user_roles_user ON group_user_roles(user_id);
 
+-- ============================================
+-- Multi-branch support: Add columns to existing tables if they don't exist
+-- ============================================
+
+-- Add group_id to laundromats if it doesn't exist
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'laundromats' AND column_name = 'group_id') THEN
+    ALTER TABLE laundromats ADD COLUMN group_id UUID REFERENCES laundromat_groups(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+-- Add is_main_branch to laundromats if it doesn't exist
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'laundromats' AND column_name = 'is_main_branch') THEN
+    ALTER TABLE laundromats ADD COLUMN is_main_branch BOOLEAN NOT NULL DEFAULT false;
+  END IF;
+END $$;
+
+-- Add group_id to laundromat_users if it doesn't exist
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'laundromat_users' AND column_name = 'group_id') THEN
+    ALTER TABLE laundromat_users ADD COLUMN group_id UUID REFERENCES laundromat_groups(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+-- Add can_access_all_branches to laundromat_users if it doesn't exist
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'laundromat_users' AND column_name = 'can_access_all_branches') THEN
+    ALTER TABLE laundromat_users ADD COLUMN can_access_all_branches BOOLEAN NOT NULL DEFAULT false;
+  END IF;
+END $$;
+
+-- Make laundromat_id nullable in laundromat_users if needed
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'laundromat_users' AND column_name = 'laundromat_id' AND is_nullable = 'NO') THEN
+    ALTER TABLE laundromat_users ALTER COLUMN laundromat_id DROP NOT NULL;
+  END IF;
+END $$;
+
+-- Add group_id to admin_fee_invoices if it doesn't exist
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'admin_fee_invoices' AND column_name = 'group_id') THEN
+    ALTER TABLE admin_fee_invoices ADD COLUMN group_id UUID REFERENCES laundromat_groups(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+-- Add group_id to disbursements if it doesn't exist
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'disbursements' AND column_name = 'group_id') THEN
+    ALTER TABLE disbursements ADD COLUMN group_id UUID REFERENCES laundromat_groups(id) ON DELETE SET NULL;
+  END IF;
+END $$;
+
+-- Add group_id to laundromat_subscriptions if it doesn't exist
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'laundromat_subscriptions' AND column_name = 'group_id') THEN
+    ALTER TABLE laundromat_subscriptions ADD COLUMN group_id UUID REFERENCES laundromat_groups(id) ON DELETE CASCADE;
+  END IF;
+END $$;
+
+-- Update the generate_monthly_admin_fees function to include group_id
+CREATE OR REPLACE FUNCTION generate_monthly_admin_fees(billing_month VARCHAR(7)) RETURNS INT AS $$
+DECLARE lm RECORD; monthly_gmv DECIMAL(10,2); fee_amount DECIMAL(10,2); count_created INT := 0;
+BEGIN
+  FOR lm IN SELECT id,group_id,admin_fee_rate FROM laundromats WHERE status='active' AND admin_fee_rate > 0 LOOP
+    SELECT COALESCE(SUM(o.subtotal),0) INTO monthly_gmv FROM orders o
+    JOIN disbursements d ON d.order_id=o.id
+    WHERE o.laundromat_id=lm.id AND TO_CHAR(o.created_at,'YYYY-MM')=billing_month AND o.status='delivered';
+    IF monthly_gmv > 0 THEN
+      fee_amount := ROUND(monthly_gmv * lm.admin_fee_rate / 100, 2);
+      INSERT INTO admin_fee_invoices (group_id, laundromat_id,billing_period,monthly_gmv,admin_fee_rate,admin_fee_amount,due_date)
+      VALUES (lm.group_id, lm.id,billing_month,monthly_gmv,lm.admin_fee_rate,fee_amount,(TO_DATE(billing_month||'-01','YYYY-MM-DD')+INTERVAL '1 month + 5 days')::DATE)
+      ON CONFLICT (laundromat_id,billing_period) DO NOTHING;
+      count_created := count_created + 1;
+    END IF;
+  END LOOP;
+  RETURN count_created;
+END;
+$$ LANGUAGE plpgsql;
+
 INSERT INTO services (name,description,price_per_unit,unit,category,sort_order) VALUES
   ('Dry Cleaning','Professional dry cleaning',350,'per item','standard',1),
   ('Premium Wash','Expert fabric care',80,'per kg','standard',2),
