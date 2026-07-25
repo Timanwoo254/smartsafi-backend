@@ -556,17 +556,40 @@ INSERT INTO services (name,description,price_per_unit,unit,category,sort_order) 
   ('Fabric Conditioner','Long-lasting freshness',20,'per kg','special',11)
 ON CONFLICT (name) DO NOTHING;
 
--- Insert sample laundromat group for multi-branch support
-INSERT INTO laundromat_groups (name, business_email, business_phone, mpesa_till, commission_rate, admin_fee_rate, status, description)
-VALUES ('Quicklean Group','group@quicklean.co.ke','+254710141771','174379',15.00,5.00,'active','Smart-Safi founding partner group')
-ON CONFLICT (business_email) DO NOTHING;
+-- Insert sample laundromat group for multi-branch support (only if columns exist)
+DO $$
+BEGIN
+  -- Check if laundromat_groups table has all needed columns
+  PERFORM 1 FROM information_schema.columns 
+  WHERE table_name = 'laundromat_groups' AND column_name = 'business_email';
+  
+  IF FOUND THEN
+    INSERT INTO laundromat_groups (name, business_email, business_phone, mpesa_till, commission_rate, admin_fee_rate, status, description)
+    VALUES ('Quicklean Group','group@quicklean.co.ke','+254710141771','174379',15.00,5.00,'active','Smart-Safi founding partner group')
+    ON CONFLICT (business_email) DO NOTHING;
+  END IF;
+END $$;
 
-INSERT INTO laundromats (group_id, name, owner_name, email, phone, mpesa_till, address, area, city, latitude, longitude, commission_rate, admin_fee_rate, status, description, onboarded_at, is_main_branch)
-VALUES (
-  (SELECT id FROM laundromat_groups WHERE business_email='group@quicklean.co.ke' LIMIT 1),
-  'Quicklean Laundromat - Westlands','Titus Timan Turasha','ops@quicklean.co.ke','+254710141771','174379','14 Kenyatta Avenue','Westlands','Nairobi',-1.2680,36.8120,15.00,5.00,'active','Smart-Safi founding partner - Main Branch',NOW(),true
-)
-ON CONFLICT (email) DO NOTHING;
+DO $$
+BEGIN
+  -- Check if laundromats table has group_id and is_main_branch columns
+  PERFORM 1 FROM information_schema.columns 
+  WHERE table_name = 'laundromats' AND column_name = 'group_id';
+  
+  IF FOUND THEN
+    PERFORM 1 FROM information_schema.columns 
+    WHERE table_name = 'laundromats' AND column_name = 'is_main_branch';
+    
+    IF FOUND THEN
+      INSERT INTO laundromats (group_id, name, owner_name, email, phone, mpesa_till, address, area, city, latitude, longitude, commission_rate, admin_fee_rate, status, description, onboarded_at, is_main_branch)
+      VALUES (
+        (SELECT id FROM laundromat_groups WHERE business_email='group@quicklean.co.ke' LIMIT 1),
+        'Quicklean Laundromat - Westlands','Titus Timan Turasha','ops@quicklean.co.ke','+254710141771','174379','14 Kenyatta Avenue','Westlands','Nairobi',-1.2680,36.8120,15.00,5.00,'active','Smart-Safi founding partner - Main Branch',NOW(),true
+      )
+      ON CONFLICT (email) DO NOTHING;
+    END IF;
+  END IF;
+END $$;
 
 INSERT INTO subscription_plans (name,price,interval,features,sort_order) VALUES
   ('Starter',1500,'month','["Listed on the client app","Up to 100 orders/month","Standard support"]',1),
