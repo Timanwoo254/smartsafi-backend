@@ -309,11 +309,6 @@ CREATE INDEX IF NOT EXISTS idx_disbursements_lm ON disbursements(laundromat_id);
 CREATE INDEX IF NOT EXISTS idx_disbursements_status ON disbursements(status);
 CREATE INDEX IF NOT EXISTS idx_admin_fees_lm ON admin_fee_invoices(laundromat_id);
 CREATE INDEX IF NOT EXISTS idx_payments_mpesa ON payments(mpesa_checkout_request_id);
-CREATE INDEX IF NOT EXISTS idx_laundromats_group ON laundromats(group_id);
-CREATE INDEX IF NOT EXISTS idx_laundromat_users_group ON laundromat_users(group_id);
-CREATE INDEX IF NOT EXISTS idx_laundromat_users_laundromat ON laundromat_users(laundromat_id);
-CREATE INDEX IF NOT EXISTS idx_group_user_roles_group ON group_user_roles(group_id);
-CREATE INDEX IF NOT EXISTS idx_group_user_roles_user ON group_user_roles(user_id);
 
 -- ============================================
 -- Multi-branch support: Add columns to existing tables if they don't exist
@@ -541,6 +536,15 @@ BEGIN
     UNIQUE (group_id, user_id);
   END IF;
 END $$;
+
+-- ============================================
+-- Multi-branch indexes (must be after columns are added)
+-- ============================================
+CREATE INDEX IF NOT EXISTS idx_laundromats_group ON laundromats(group_id);
+CREATE INDEX IF NOT EXISTS idx_laundromat_users_group ON laundromat_users(group_id);
+CREATE INDEX IF NOT EXISTS idx_laundromat_users_laundromat ON laundromat_users(laundromat_id);
+CREATE INDEX IF NOT EXISTS idx_group_user_roles_group ON group_user_roles(group_id);
+CREATE INDEX IF NOT EXISTS idx_group_user_roles_user ON group_user_roles(user_id);
 
 INSERT INTO services (name,description,price_per_unit,unit,category,sort_order) VALUES
   ('Dry Cleaning','Professional dry cleaning',350,'per item','standard',1),
