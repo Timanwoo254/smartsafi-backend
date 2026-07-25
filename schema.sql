@@ -500,28 +500,9 @@ BEGIN
   END IF;
 END $$;
 
--- Update unique constraint for laundromat_users (laundromat_id, user_id) to allow NULL laundromat_id
-DO $$
-BEGIN
-  -- Drop the old unique constraint if it exists (doesn't allow NULL)
-  IF EXISTS (
-    SELECT 1 FROM information_schema.table_constraints 
-    WHERE constraint_type = 'UNIQUE' AND table_name = 'laundromat_users' 
-    AND constraint_name = 'laundromat_users_laundromat_id_user_id_key'
-  ) THEN
-    ALTER TABLE laundromat_users DROP CONSTRAINT laundromat_users_laundromat_id_user_id_key;
-  END IF;
-  
-  -- Check if the partial unique index already exists
-  PERFORM 1 FROM pg_indexes 
-  WHERE tablename = 'laundromat_users' AND indexname = 'uniq_laundromat_users_laundromat_user';
-  
-  -- Only create if it doesn't exist
-  IF NOT FOUND THEN
-    CREATE UNIQUE INDEX uniq_laundromat_users_laundromat_user 
-    ON laundromat_users(laundromat_id, user_id) WHERE laundromat_id IS NOT NULL;
-  END IF;
-END $$;
+-- Note: The original UNIQUE(laundromat_id, user_id) constraint already allows NULL values
+-- since PostgreSQL treats NULL as distinct in unique constraints.
+-- No need for partial unique index since laundromat_id is now nullable.
 
 -- Add unique constraint for group_user_roles (group_id, user_id)
 DO $$
