@@ -4,13 +4,17 @@ const bcrypt=require('bcryptjs');
 const jwt=require('jsonwebtoken');
 
 function haversine(la1,lo1,la2,lo2){const R=6371,dL=(la2-la1)*Math.PI/180,dO=(lo2-lo1)*Math.PI/180;const a=Math.sin(dL/2)**2+Math.cos(la1*Math.PI/180)*Math.cos(la2*Math.PI/180)*Math.sin(dO/2)**2;return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));}
+function normalizePhone(phone){let np=phone.replace(/[\s\-()]/g,'');if(np.startsWith('0'))np='+254'+np.slice(1);else if(np.startsWith('254'))np='+'+np;else if(!np.startsWith('+'))np='+254'+np;return np;}
 
-function normalizePhone(phone){
-  let np=phone.replace(/[\s\-()]/g,'');
-  if(np.startsWith('0'))np='+254'+np.slice(1);
-  else if(np.startsWith('254'))np='+'+np;
-  else if(!np.startsWith('+'))np='+254'+np;
-  return np;
+function buildTree(rows){
+  const byId={};
+  rows.forEach(r=>byId[r.id]={...r,children:[]});
+  const roots=[];
+  rows.forEach(r=>{
+    if(r.parent_id && byId[r.parent_id]) byId[r.parent_id].children.push(byId[r.id]);
+    else if(!r.parent_id) roots.push(byId[r.id]);
+  });
+  return roots;
 }
 
 router.get('/',async(req,res)=>{
@@ -26,72 +30,56 @@ router.get('/',async(req,res)=>{
   }catch(e){console.error('List:',e.message);res.status(500).json({success:false,message:'Failed'});}
 });
 
-// ── NEW: Public self-service registration for laundromat owners ──
-// Creates the laundromat (status='pending') AND the owner's login account
-// atomically. No authentication required -- this is how new partners join.
-// Commission/admin-fee rates are NOT settable here; they default to the
-// platform standard (15% / 5%) and can only be changed by an admin later.
 router.post('/register', async (req, res) => {
   const { name, address, area, city, mpesa_till, description, owner_name, email, phone, password } = req.body;
-
   if (!name || !address || !owner_name || !email || !phone || !password)
     return res.status(400).json({ success:false, message:'Business name, address, owner name, email, phone and password are required' });
   if (password.length < 8)
     return res.status(400).json({ success:false, message:'Password must be at least 8 characters' });
-
   const np = normalizePhone(phone);
   const client = await getClient();
   try {
     await client.query('BEGIN');
-
     const exLm = await client.query('SELECT id FROM laundromats WHERE email=$1 OR phone=$2', [email, np]);
     if (exLm.rows.length) { await client.query('ROLLBACK'); return res.status(409).json({ success:false, message:'A laundromat with this email or phone is already registered' }); }
-
     const exUser = await client.query('SELECT id FROM users WHERE email=$1 OR phone=$2', [email, np]);
     if (exUser.rows.length) { await client.query('ROLLBACK'); return res.status(409).json({ success:false, message:'An account with this email or phone already exists' }); }
-
     const lm = await client.query(
       "INSERT INTO laundromats(name,owner_name,email,phone,address,area,city,mpesa_till,description,commission_rate,admin_fee_rate,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,15,5,'pending') RETURNING *",
       [name, owner_name, email, np, address, area||null, city||'Nairobi', mpesa_till||null, description||null]
     );
-
     const hash = await bcrypt.hash(password, 12);
     const ur = await client.query(
       "INSERT INTO users(name,email,phone,password_hash,role) VALUES($1,$2,$3,$4,'laundromat') RETURNING id,name,email,phone,role,token_version",
       [owner_name.trim(), email, np, hash]
     );
     const newUser = ur.rows[0];
-
-    await client.query(
-      "INSERT INTO laundromat_users(laundromat_id,user_id,staff_role) VALUES($1,$2,'owner')",
-      [lm.rows[0].id, newUser.id]
-    );
-
+    await client.query("INSERT INTO laundromat_users(laundromat_id,user_id,staff_role) VALUES($1,$2,'owner')",[lm.rows[0].id, newUser.id]);
     await client.query('COMMIT');
-
     const token = jwt.sign(
       { id:newUser.id, email:newUser.email, name:newUser.name, role:newUser.role, laundromat_id: lm.rows[0].id, tokenVersion:newUser.token_version },
-      process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
+      process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
-
     await auditLog(newUser.id, 'laundromat', 'LAUNDROMAT_SELF_REGISTERED', 'laundromats', lm.rows[0].id, req);
-
     res.status(201).json({
-      success: true,
-      message: 'Registration successful. Your laundromat is pending admin approval.',
-      data: {
-        user: { id:newUser.id, name:newUser.name, email:newUser.email, phone:newUser.phone, role:newUser.role },
-        token,
-        laundromat: { id: lm.rows[0].id, name: lm.rows[0].name, status: lm.rows[0].status, commission_rate: lm.rows[0].commission_rate, admin_fee_rate: lm.rows[0].admin_fee_rate },
-      }
+      success: true, message: 'Registration successful. Your laundromat is pending admin approval.',
+      data: { user: { id:newUser.id, name:newUser.name, email:newUser.email, phone:newUser.phone, role:newUser.role }, token,
+        laundromat: { id: lm.rows[0].id, name: lm.rows[0].name, status: lm.rows[0].status, commission_rate: lm.rows[0].commission_rate, admin_fee_rate: lm.rows[0].admin_fee_rate } }
     });
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('Register laundromat:', e.message);
     res.status(500).json({ success:false, message:'Registration failed' });
-  } finally {
-    client.release();
+  } finally { client.release(); }
+});
+
+router.get('/services-catalog', async (req, res) => {
+  try {
+    const r = await query('SELECT id,name,parent_id,tier,price_per_unit,unit,sort_order FROM services WHERE is_active=true ORDER BY tier,sort_order');
+    res.json({ success:true, data: buildTree(r.rows) });
+  } catch (e) {
+    console.error('Services catalog:', e.message);
+    res.status(500).json({ success:false, message:'Failed to load service catalog' });
   }
 });
 
@@ -99,14 +87,23 @@ router.get('/:id',async(req,res)=>{
   try{
     const lm=await query("SELECT l.id,l.name,l.owner_name,l.address,l.area,l.city,l.latitude,l.longitude,l.rating_avg,l.rating_count,l.description,l.logo_url,l.operating_hours,l.phone FROM laundromats l WHERE l.id=$1 AND l.status='active'",[req.params.id]);
     if(!lm.rows.length)return res.status(404).json({success:false,message:'Not found'});
-    const sv=await query("SELECT s.id,s.name,s.description,s.category,s.unit,COALESCE(ls.price_override,s.price_per_unit)AS price_per_unit FROM services s LEFT JOIN laundromat_services ls ON ls.service_id=s.id AND ls.laundromat_id=$1 WHERE s.is_active=true AND(ls.is_active IS NULL OR ls.is_active=true)ORDER BY s.category,s.sort_order",[req.params.id]);
+    const offered = await query(
+      `SELECT s.id, s.parent_id, s.tier, COALESCE(ls.price_override, s.price_per_unit) AS price_per_unit
+       FROM laundromat_services ls JOIN services s ON s.id = ls.service_id
+       WHERE ls.laundromat_id = $1 AND ls.is_active = true AND s.is_active = true`,
+      [req.params.id]
+    );
+    const allServices = await query('SELECT id,name,parent_id,tier,unit,sort_order FROM services WHERE is_active=true');
+    const byId = {}; allServices.rows.forEach(s => byId[s.id] = s);
+    const neededIds = new Set();
+    offered.rows.forEach(leaf => { let cur = leaf.id; while (cur) { neededIds.add(cur); cur = byId[cur]?.parent_id; } });
+    const priceById = {}; offered.rows.forEach(o => priceById[o.id] = o.price_per_unit);
+    const prunedRows = allServices.rows.filter(s => neededIds.has(s.id)).map(s => ({ ...s, price_per_unit: priceById[s.id] ?? null }));
     const rv=await query("SELECT r.rating,r.comment,r.created_at,u.name AS client_name FROM reviews r JOIN users u ON u.id=r.client_id WHERE r.laundromat_id=$1 AND r.is_flagged=false ORDER BY r.created_at DESC LIMIT 10",[req.params.id]);
-    res.json({success:true,data:{...lm.rows[0],services:sv.rows,reviews:rv.rows}});
-  }catch{res.status(500).json({success:false,message:'Failed'});}
+    res.json({success:true,data:{...lm.rows[0],services:buildTree(prunedRows),reviews:rv.rows}});
+  }catch(e){console.error('Get laundromat:',e.message);res.status(500).json({success:false,message:'Failed'});}
 });
 
-// Admin-initiated creation retained as a fallback capability (e.g. manual/phone onboarding).
-// Not exposed in the admin dashboard UI anymore, but available if ever needed directly.
 router.post('/',authenticate,isAdmin,async(req,res)=>{
   const{name,owner_name,email,phone,address,area,city,latitude,longitude,commission_rate=15,admin_fee_rate=5,mpesa_till,description,password}=req.body;
   if(!name||!owner_name||!email||!phone||!address)return res.status(400).json({success:false,message:'Required fields missing'});
@@ -128,10 +125,7 @@ router.post('/',authenticate,isAdmin,async(req,res)=>{
     let ownerAccount = null;
     if(password){
       const hash = await bcrypt.hash(password,12);
-      const ur = await client.query(
-        "INSERT INTO users(name,email,phone,password_hash,role) VALUES($1,$2,$3,$4,'laundromat') RETURNING id,name,email,phone",
-        [owner_name.trim(),email,np,hash]
-      );
+      const ur = await client.query("INSERT INTO users(name,email,phone,password_hash,role) VALUES($1,$2,$3,$4,'laundromat') RETURNING id,name,email,phone",[owner_name.trim(),email,np,hash]);
       ownerAccount = ur.rows[0];
       await client.query("INSERT INTO laundromat_users(laundromat_id,user_id,staff_role) VALUES($1,$2,'owner')",[lm.rows[0].id, ownerAccount.id]);
     }
@@ -142,9 +136,7 @@ router.post('/',authenticate,isAdmin,async(req,res)=>{
     await client.query('ROLLBACK');
     console.error('Create:',e.message);
     res.status(500).json({success:false,message:'Failed'});
-  }finally{
-    client.release();
-  }
+  }finally{ client.release(); }
 });
 
 router.patch('/:id',authenticate,isStaff,ownLaundromat,async(req,res)=>{
@@ -156,6 +148,32 @@ router.patch('/:id',authenticate,isStaff,ownLaundromat,async(req,res)=>{
     if(!r.rows.length)return res.status(404).json({success:false,message:'Not found'});
     res.json({success:true,data:r.rows[0]});
   }catch{res.status(500).json({success:false,message:'Failed'});}
+});
+
+router.delete('/:id', authenticate, isAdmin, async (req, res) => {
+  try {
+    const orderCheck = await query('SELECT COUNT(*)::int AS c FROM orders WHERE laundromat_id=$1', [req.params.id]);
+    if (orderCheck.rows[0].c > 0) {
+      return res.status(409).json({ success:false, message:`Cannot delete -- this laundromat has ${orderCheck.rows[0].c} order(s) on record. Suspend it instead to preserve order history.` });
+    }
+    const client = await getClient();
+    try {
+      await client.query('BEGIN');
+      await client.query('DELETE FROM laundromat_services WHERE laundromat_id=$1', [req.params.id]);
+      await client.query('DELETE FROM laundromat_users WHERE laundromat_id=$1', [req.params.id]);
+      const r = await client.query('DELETE FROM laundromats WHERE id=$1 RETURNING id,name', [req.params.id]);
+      if (!r.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ success:false, message:'Not found' }); }
+      await client.query('COMMIT');
+      await auditLog(req.user.id, req.user.role, 'LAUNDROMAT_DELETED', 'laundromats', req.params.id, req, { name: r.rows[0].name });
+      res.json({ success:true, message:'Laundromat deleted' });
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally { client.release(); }
+  } catch (e) {
+    console.error('Delete laundromat:', e.message);
+    res.status(500).json({ success:false, message:'Failed to delete' });
+  }
 });
 
 router.get('/:laundromat_id/orders',authenticate,isStaff,ownLaundromat,async(req,res)=>{
@@ -180,10 +198,7 @@ router.post('/:id/staff',authenticate,isAdmin,async(req,res)=>{
 async function isStaffManager(req, res, next) {
   if (['admin', 'superadmin'].includes(req.user.role)) return next();
   try {
-    const r = await query(
-      "SELECT staff_role FROM laundromat_users WHERE laundromat_id=$1 AND user_id=$2 AND is_active=true",
-      [req.params.laundromat_id, req.user.id]
-    );
+    const r = await query("SELECT staff_role FROM laundromat_users WHERE laundromat_id=$1 AND user_id=$2 AND is_active=true",[req.params.laundromat_id, req.user.id]);
     if (!r.rows.length || !['owner', 'manager'].includes(r.rows[0].staff_role)) {
       return res.status(403).json({ success: false, message: 'Only laundromat owners or managers can manage staff' });
     }
@@ -197,19 +212,12 @@ async function isStaffManager(req, res, next) {
 router.get('/:laundromat_id/staff', authenticate, isStaff, ownLaundromat, async (req, res) => {
   try {
     const r = await query(
-      `SELECT lu.id, lu.staff_role, lu.is_active AS staff_is_active, lu.created_at AS joined_at,
-              u.id AS user_id, u.name, u.email, u.phone, u.is_active
-       FROM laundromat_users lu
-       JOIN users u ON u.id = lu.user_id
-       WHERE lu.laundromat_id = $1
-       ORDER BY lu.created_at ASC`,
+      `SELECT lu.id, lu.staff_role, lu.is_active AS staff_is_active, lu.created_at AS joined_at, u.id AS user_id, u.name, u.email, u.phone, u.is_active
+       FROM laundromat_users lu JOIN users u ON u.id = lu.user_id WHERE lu.laundromat_id = $1 ORDER BY lu.created_at ASC`,
       [req.params.laundromat_id]
     );
     res.json({ success: true, data: r.rows });
-  } catch (e) {
-    console.error('Get staff:', e.message);
-    res.status(500).json({ success: false, message: 'Failed to load staff' });
-  }
+  } catch (e) { console.error('Get staff:', e.message); res.status(500).json({ success: false, message: 'Failed to load staff' }); }
 });
 
 router.post('/:laundromat_id/staff/invite', authenticate, isStaff, ownLaundromat, isStaffManager, async (req, res) => {
@@ -224,15 +232,9 @@ router.post('/:laundromat_id/staff/invite', authenticate, isStaff, ownLaundromat
     const ex = await client.query('SELECT id FROM users WHERE email=$1 OR phone=$2', [email, np]);
     if (ex.rows.length) { await client.query('ROLLBACK'); return res.status(409).json({ success: false, message: 'A user with this email or phone already exists' }); }
     const hash = await bcrypt.hash(password, 12);
-    const ur = await client.query(
-      "INSERT INTO users(name,email,phone,password_hash,role) VALUES($1,$2,$3,$4,'laundromat') RETURNING id,name,email,phone",
-      [name.trim(), email, np, hash]
-    );
+    const ur = await client.query("INSERT INTO users(name,email,phone,password_hash,role) VALUES($1,$2,$3,$4,'laundromat') RETURNING id,name,email,phone",[name.trim(), email, np, hash]);
     const newUser = ur.rows[0];
-    const lr = await client.query(
-      "INSERT INTO laundromat_users(laundromat_id,user_id,staff_role) VALUES($1,$2,$3) RETURNING id,staff_role,is_active,created_at",
-      [req.params.laundromat_id, newUser.id, staff_role]
-    );
+    const lr = await client.query("INSERT INTO laundromat_users(laundromat_id,user_id,staff_role) VALUES($1,$2,$3) RETURNING id,staff_role,is_active,created_at",[req.params.laundromat_id, newUser.id, staff_role]);
     await client.query('COMMIT');
     await auditLog(req.user.id, req.user.role, 'STAFF_INVITED', 'laundromat_users', lr.rows[0].id, req, { laundromat_id: req.params.laundromat_id, invited_user: newUser.id });
     res.status(201).json({ success: true, message: 'Staff invited', data: { ...lr.rows[0], name: newUser.name, email: newUser.email, phone: newUser.phone, user_id: newUser.id, staff_is_active: lr.rows[0].is_active } });
@@ -240,9 +242,7 @@ router.post('/:laundromat_id/staff/invite', authenticate, isStaff, ownLaundromat
     await client.query('ROLLBACK');
     console.error('Invite staff:', e.message);
     res.status(500).json({ success: false, message: 'Failed to invite staff' });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
 router.patch('/:laundromat_id/staff/:staffId', authenticate, isStaff, ownLaundromat, isStaffManager, async (req, res) => {
@@ -256,19 +256,45 @@ router.patch('/:laundromat_id/staff/:staffId', authenticate, isStaff, ownLaundro
       const wouldRemoveLastOwner = owners.rows[0].c <= 1 && (is_active === false || (staff_role && staff_role !== 'owner'));
       if (wouldRemoveLastOwner) return res.status(400).json({ success: false, message: 'Cannot remove the last active owner of this laundromat' });
     }
-    const r = await query(
-      'UPDATE laundromat_users SET staff_role=COALESCE($1,staff_role), is_active=COALESCE($2,is_active) WHERE id=$3 RETURNING id,staff_role,is_active',
-      [staff_role || null, is_active === undefined ? null : is_active, req.params.staffId]
-    );
-    if (is_active === false) {
-      await query('UPDATE users SET token_version=token_version+1 WHERE id=$1', [cur.rows[0].uid]);
-    }
+    const r = await query('UPDATE laundromat_users SET staff_role=COALESCE($1,staff_role), is_active=COALESCE($2,is_active) WHERE id=$3 RETURNING id,staff_role,is_active',[staff_role || null, is_active === undefined ? null : is_active, req.params.staffId]);
+    if (is_active === false) await query('UPDATE users SET token_version=token_version+1 WHERE id=$1', [cur.rows[0].uid]);
     await auditLog(req.user.id, req.user.role, 'STAFF_UPDATED', 'laundromat_users', req.params.staffId, req, { is_active, staff_role });
     res.json({ success: true, data: r.rows[0] });
+  } catch (e) { console.error('Update staff:', e.message); res.status(500).json({ success: false, message: 'Failed to update staff' }); }
+});
+
+router.put('/:laundromat_id/services', authenticate, isStaff, ownLaundromat, isStaffManager, async (req, res) => {
+  const { service_ids } = req.body;
+  if (!Array.isArray(service_ids)) return res.status(400).json({ success:false, message:'service_ids must be an array' });
+  const client = await getClient();
+  try {
+    await client.query('BEGIN');
+    if (service_ids.length) {
+      const check = await client.query(
+        `SELECT s.id, s.name, (SELECT COUNT(*) FROM services c WHERE c.parent_id = s.id)::int AS child_count FROM services s WHERE s.id = ANY($1::uuid[])`,
+        [service_ids]
+      );
+      if (check.rows.length !== service_ids.length) { await client.query('ROLLBACK'); return res.status(400).json({ success:false, message:'One or more service_ids do not exist' }); }
+      const nonLeaf = check.rows.filter(r => r.child_count > 0);
+      if (nonLeaf.length) { await client.query('ROLLBACK'); return res.status(400).json({ success:false, message:'Cannot select a category, only specific services: ' + nonLeaf.map(r=>r.name).join(', ') }); }
+      await client.query(`UPDATE laundromat_services SET is_active=false WHERE laundromat_id=$1 AND service_id != ALL($2::uuid[])`,[req.params.laundromat_id, service_ids]);
+      for (const sid of service_ids) {
+        await client.query(
+          `INSERT INTO laundromat_services(laundromat_id, service_id, is_active) VALUES($1,$2,true) ON CONFLICT (laundromat_id, service_id) DO UPDATE SET is_active=true`,
+          [req.params.laundromat_id, sid]
+        );
+      }
+    } else {
+      await client.query('UPDATE laundromat_services SET is_active=false WHERE laundromat_id=$1', [req.params.laundromat_id]);
+    }
+    await client.query('COMMIT');
+    await auditLog(req.user.id, req.user.role, 'SERVICES_UPDATED', 'laundromats', req.params.laundromat_id, req, { count: service_ids.length });
+    res.json({ success:true, message:'Services updated' });
   } catch (e) {
-    console.error('Update staff:', e.message);
-    res.status(500).json({ success: false, message: 'Failed to update staff' });
-  }
+    await client.query('ROLLBACK');
+    console.error('Update services:', e.message);
+    res.status(500).json({ success:false, message:'Failed to update services' });
+  } finally { client.release(); }
 });
 
 module.exports=router;
