@@ -1,7 +1,18 @@
-const express=require('express'),router=express.Router();
+const express=require('express'),router=express.Router(),axios=require('axios');
 const {query}=require('../../utils/db'),{authenticate,auditLog}=require('../../middleware/auth.middleware');
-const {getProvider,PROVIDERS}=require('./providers');
-const {notifyNewOrder}=require('../../utils/notify');
+
+// Strips accidental wrapping quotes and whitespace from an env var. Protects
+// against the exact class of bug where a value copied from a .env file or
+// JSON response (already wrapped in quotes) gets pasted into Railway's UI
+// with those quotes included literally -- which silently corrupts anything
+// built from that value (like the STK Push password hash) without ever
+// throwing an error, making it very hard to spot.
+function cleanEnv(v){
+  if(!v) return v;
+  let s=String(v).trim();
+  if(s.length>1 && s.startsWith('"') && s.endsWith('"')) s=s.slice(1,-1);
+  return s;
+}
 
 function validateSafaricomIP(req,res,next){
   if(process.env.NODE_ENV!=='production')return next();
@@ -11,135 +22,90 @@ function validateSafaricomIP(req,res,next){
   next();
 }
 
-// Mark an order confirmed after a successful (online or cash) payment.
-async function confirmOrder(orderId,note){
-  const r=await query("UPDATE orders SET status='confirmed',updated_at=NOW() WHERE id=$1 AND status='pending' RETURNING *",[orderId]);
-  if(!r.rows.length)return null;
-  await query("INSERT INTO order_status_history(order_id,status,note)VALUES($1,'confirmed',$2)",[orderId,note||'Payment received']);
-  return r.rows[0];
+async function getMpesaToken(){
+  const consumerKey=cleanEnv(process.env.MPESA_CONSUMER_KEY);
+  const consumerSecret=cleanEnv(process.env.MPESA_CONSUMER_SECRET);
+  if(!consumerKey||!consumerSecret)throw new Error('MPESA_CONSUMER_KEY or MPESA_CONSUMER_SECRET missing');
+  const auth=Buffer.from(`${consumerKey}:${consumerSecret}`).toString('base64');
+  const base=process.env.MPESA_ENV==='production'?'https://api.safaricom.co.ke':'https://sandbox.safaricom.co.ke';
+  const res=await axios.get(`${base}/oauth/v1/generate?grant_type=client_credentials`,{headers:{Authorization:`Basic ${auth}`}});
+  return res.data.access_token;
 }
 
-// Shared initiation: pick a provider, call it, record a pending payment row.
-async function initiatePayment(provider,order,userId){
-  const out=await provider.initiate({amount:order.total_amount,phone:order._phone,reference:order.order_number,description:`SmartSafi ${order.order_number}`});
-  await query("INSERT INTO payments(order_id,user_id,amount,method,status,mpesa_checkout_request_id,transaction_reference)VALUES($1,$2,$3,$4,'pending',$5,$6)",
-    [order.id,userId,order.total_amount,provider.name,provider.name==='mpesa'?out.providerRef:null,out.providerRef]);
-  return out;
-}
-async function loadPayableOrder(orderId,userId){
-  const or=await query('SELECT * FROM orders WHERE id=$1 AND user_id=$2',[orderId,userId]);
-  if(!or.rows.length)return{err:404};
-  if(or.rows[0].status!=='pending')return{err:'paid',order:or.rows[0]};
-  return{order:or.rows[0]};
+function buildStkPassword(shortcode,timestamp){
+  const passkey=cleanEnv(process.env.MPESA_PASSKEY);
+  if(!passkey)throw new Error('MPESA_PASSKEY missing');
+  return Buffer.from(`${shortcode}${passkey}${timestamp}`).toString('base64');
 }
 
-// Generic, provider-agnostic payment initiation for an order.
-router.post('/initiate',authenticate,async(req,res)=>{
-  const{orderId,phone}=req.body;
-  if(!orderId||!phone)return res.status(400).json({success:false,message:'orderId and phone required'});
-  try{
-    const {err,order}=await loadPayableOrder(orderId,req.user.id);
-    if(err===404)return res.status(404).json({success:false,message:'Order not found'});
-    if(err==='paid')return res.status(400).json({success:false,message:'Order already paid'});
-    const provider=getProvider();order._phone=phone;
-    const out=await initiatePayment(provider,order,req.user.id);
-    await auditLog(req.user.id,'client','PAYMENT_INITIATED','payments',null,req,{orderId,provider:provider.name});
-    res.json({success:true,message:out.userMessage||'Payment initiated',data:{provider:provider.name,reference:order.order_number,providerRef:out.providerRef}});
-  }catch(e){console.error('Initiate payment:',e.response?.data||e.message);res.status(500).json({success:false,message:'Payment initiation failed'});}
-});
-
-// Back-compat: legacy M-Pesa-specific endpoint, always uses the M-Pesa provider.
 router.post('/mpesa/stk-push',authenticate,async(req,res)=>{
   const{orderId,phone}=req.body;
   if(!orderId||!phone)return res.status(400).json({success:false,message:'orderId and phone required'});
   try{
-    const {err,order}=await loadPayableOrder(orderId,req.user.id);
-    if(err===404)return res.status(404).json({success:false,message:'Order not found'});
-    if(err==='paid')return res.status(400).json({success:false,message:'Order already paid'});
-    order._phone=phone;
-    const out=await initiatePayment(PROVIDERS.mpesa,order,req.user.id);
-    await auditLog(req.user.id,'client','PAYMENT_INITIATED','payments',null,req,{orderId,provider:'mpesa'});
-    res.json({success:true,message:'Check your phone for M-Pesa prompt',data:{checkoutRequestId:out.providerRef}});
-  }catch(e){console.error('STK push:',e.response?.data||e.message);res.status(500).json({success:false,message:'Payment initiation failed'});}
+    const or=await query('SELECT * FROM orders WHERE id=$1 AND user_id=$2',[orderId,req.user.id]);
+    if(!or.rows.length)return res.status(404).json({success:false,message:'Order not found'});
+    if(or.rows[0].status!=='pending')return res.status(400).json({success:false,message:'Order already paid'});
+    let p=phone.replace(/\s+/g,'');if(p.startsWith('+'))p=p.slice(1);if(p.startsWith('0'))p='254'+p.slice(1);
+    const token=await getMpesaToken();
+    const ts=new Date().toISOString().replace(/[-T:.Z]/g,'').slice(0,14);
+    const shortcode=cleanEnv(process.env.MPESA_SHORTCODE);
+    const pwd=buildStkPassword(shortcode,ts);
+    const base=process.env.MPESA_ENV==='production'?'https://api.safaricom.co.ke':'https://sandbox.safaricom.co.ke';
+    const callbackUrl=cleanEnv(process.env.MPESA_CALLBACK_URL);
+    const resp=await axios.post(`${base}/mpesa/stkpush/v1/processrequest`,{BusinessShortCode:shortcode,Password:pwd,Timestamp:ts,TransactionType:'CustomerPayBillOnline',Amount:Math.ceil(or.rows[0].total_amount),PartyA:p,PartyB:shortcode,PhoneNumber:p,CallBackURL:callbackUrl,AccountReference:or.rows[0].order_number,TransactionDesc:`SmartSafi ${or.rows[0].order_number}`},{headers:{Authorization:`Bearer ${token}`}});
+    await query("INSERT INTO payments(order_id,user_id,amount,method,status,mpesa_checkout_request_id)VALUES($1,$2,$3,'mpesa','pending',$4)",[orderId,req.user.id,or.rows[0].total_amount,resp.data.CheckoutRequestID]);
+    console.log(`STK push: ${p.slice(0,5)}***${p.slice(-3)} order=${or.rows[0].order_number}`);
+    await auditLog(req.user.id,'client','PAYMENT_INITIATED','payments',null,req,{orderId});
+    res.json({success:true,message:'Check your phone for M-Pesa prompt',data:{checkoutRequestId:resp.data.CheckoutRequestID}});
+  }catch(e){console.error('STK push:',e.response?.data||e.message);res.status(500).json({success:false,message:e.response?.data?.errorMessage||'Payment initiation failed'});}
 });
 
-// Cash on delivery / "pay later": confirm the order immediately so it reaches the laundromat.
-router.post('/cash',authenticate,async(req,res)=>{
-  const{orderId}=req.body;
-  if(!orderId)return res.status(400).json({success:false,message:'orderId required'});
-  try{
-    const {err,order}=await loadPayableOrder(orderId,req.user.id);
-    if(err===404)return res.status(404).json({success:false,message:'Order not found'});
-    if(err==='paid')return res.json({success:true,data:order});
-    await query("INSERT INTO payments(order_id,user_id,amount,method,status)VALUES($1,$2,$3,'cash','pending')",[orderId,req.user.id,order.total_amount]);
-    const confirmed=await confirmOrder(orderId,'Cash on delivery');
-    notifyNewOrder(req.app.get('io'),confirmed||order);
-    await auditLog(req.user.id,'client','ORDER_COD','orders',orderId,req,{});
-    res.json({success:true,data:confirmed||order});
-  }catch(e){console.error('Cash order:',e.message);res.status(500).json({success:false,message:'Failed'});}
-});
-
-// Unified webhook: /webhook/mpesa, /webhook/mulaflow, ...
-router.post('/webhook/:provider',validateSafaricomIP,async(req,res)=>{
-  res.json({ResultCode:0,ResultDesc:'Accepted',received:true});
-  try{await processWebhook(req.params.provider,req);}catch(e){console.error('Webhook:',e.message);}
-});
-// Back-compat M-Pesa callback path.
+// Handles BOTH order-payment STK callbacks AND admin-fee-collection STK
+// callbacks -- discriminated by which table the CheckoutRequestID actually
+// matches, since both flows share the same Safaricom callback shape.
 router.post('/mpesa/callback',validateSafaricomIP,async(req,res)=>{
   res.json({ResultCode:0,ResultDesc:'Accepted'});
-  try{await processWebhook('mpesa',req);}catch(e){console.error('Callback:',e.message);}
-});
+  try{
+    const cb=req.body?.Body?.stkCallback;if(!cb)return;
+    const{CheckoutRequestID,ResultCode,CallbackMetadata}=cb;
 
-async function processWebhook(providerName,req){
-  const provider=getProvider(providerName);
-  const parsed=provider.parseWebhook(req);
-  if(!parsed||parsed.invalid)return;
-  // Subscription payments use a SUB-<id> reference, handled by the subscription service.
-  if(parsed.reference&&String(parsed.reference).startsWith('SUB-')){
-    const sub=require('../subscriptions/subscription.service');await sub.handlePaymentWebhook(parsed);return;
-  }
-  const ref=parsed.providerRef;
-  if(parsed.status==='completed'){
-    const pr=await query("UPDATE payments SET status='completed',mpesa_receipt_number=COALESCE($1,mpesa_receipt_number),transaction_reference=COALESCE(transaction_reference,$2),paid_at=NOW(),callback_received_at=NOW() WHERE mpesa_checkout_request_id=$2 OR transaction_reference=$2 RETURNING order_id",[parsed.receipt,ref]);
+    const pr=await query('SELECT order_id FROM payments WHERE mpesa_checkout_request_id=$1',[CheckoutRequestID]);
     if(pr.rows.length){
-      const order=await confirmOrder(pr.rows[0].order_id,parsed.receipt?`Paid — ref: ${parsed.receipt}`:'Payment received');
-      if(order)notifyNewOrder(req.app.get('io'),order);
+      if(ResultCode===0){
+        const meta=CallbackMetadata?.Item||[];
+        const receipt=meta.find(i=>i.Name==='MpesaReceiptNumber')?.Value;
+        await query("UPDATE payments SET status='completed',mpesa_receipt_number=$1,paid_at=NOW() WHERE mpesa_checkout_request_id=$2",[receipt,CheckoutRequestID]);
+        await query("UPDATE orders SET status='confirmed',updated_at=NOW() WHERE id=$1",[pr.rows[0].order_id]);
+        await query("INSERT INTO order_status_history(order_id,status,note)VALUES($1,'confirmed',$2)",[pr.rows[0].order_id,`Paid — ref: ${receipt}`]);
+      }else{
+        await query("UPDATE payments SET status='failed' WHERE mpesa_checkout_request_id=$1",[CheckoutRequestID]);
+      }
+      return;
     }
-  }else if(parsed.status==='failed'){
-    await query("UPDATE payments SET status='failed',callback_received_at=NOW() WHERE mpesa_checkout_request_id=$1 OR transaction_reference=$1",[ref]);
-  }
-}
+
+    const ir=await query('SELECT id,laundromat_id FROM admin_fee_invoices WHERE checkout_request_id=$1',[CheckoutRequestID]);
+    if(ir.rows.length){
+      if(ResultCode===0){
+        const meta=CallbackMetadata?.Item||[];
+        const receipt=meta.find(i=>i.Name==='MpesaReceiptNumber')?.Value;
+        await query("UPDATE admin_fee_invoices SET status='paid',mpesa_reference=$1,paid_at=NOW() WHERE checkout_request_id=$2",[receipt,CheckoutRequestID]);
+        console.log(`Admin fee collected: invoice=${ir.rows[0].id} ref=${receipt}`);
+      }else{
+        await query("UPDATE admin_fee_invoices SET status='pending' WHERE checkout_request_id=$1",[CheckoutRequestID]);
+      }
+      return;
+    }
+
+    console.warn('Callback CheckoutRequestID matched neither payments nor admin_fee_invoices:',CheckoutRequestID);
+  }catch(e){console.error('Callback:',e.message);}
+});
 
 router.post('/mpesa/b2c-result',validateSafaricomIP,(req,res)=>{const{handleB2CResult}=require('../commission/commission.service');return handleB2CResult(req,res);});
 router.post('/mpesa/b2c-timeout',(req,res)=>res.json({ResultCode:0,ResultDesc:'Accepted'}));
+
 router.get('/order/:orderId',authenticate,async(req,res)=>{
   try{const r=await query('SELECT * FROM payments WHERE order_id=$1 AND user_id=$2 ORDER BY created_at DESC LIMIT 1',[req.params.orderId,req.user.id]);res.json({success:true,data:r.rows[0]||null});}
   catch{res.status(500).json({success:false,message:'Failed'});}
 });
 
-// Reconcile a payment by querying the provider — used when the async callback can't reach us
-// (e.g. a LAN dev box). Idempotent: returns the current status whether or not it changed.
-router.post('/reconcile',authenticate,async(req,res)=>{
-  const{orderId}=req.body;
-  if(!orderId)return res.status(400).json({success:false,message:'orderId required'});
-  try{
-    const pr=await query('SELECT * FROM payments WHERE order_id=$1 AND user_id=$2 ORDER BY created_at DESC LIMIT 1',[orderId,req.user.id]);
-    const pay=pr.rows[0];
-    if(!pay)return res.json({success:true,data:{status:'none'}});
-    // Terminal states are authoritative — don't re-query (avoids sandbox status flip-flop).
-    if(pay.status==='completed'||pay.status==='failed')return res.json({success:true,data:{status:pay.status}});
-    const provider=getProvider(pay.method);
-    const ref=pay.mpesa_checkout_request_id||pay.transaction_reference;
-    if(!ref||typeof provider.query!=='function')return res.json({success:true,data:{status:pay.status}});
-    const q=await provider.query(ref);
-    if(q.status==='completed'){
-      await query("UPDATE payments SET status='completed',paid_at=NOW() WHERE id=$1",[pay.id]);
-      const order=await confirmOrder(orderId,'Payment received');
-      if(order)notifyNewOrder(req.app.get('io'),order);
-    }else if(q.status==='failed'){
-      await query("UPDATE payments SET status='failed' WHERE id=$1",[pay.id]);
-    }
-    res.json({success:true,data:{status:q.status}});
-  }catch(e){console.error('Reconcile:',e.message);res.status(500).json({success:false,message:'Failed'});}
-});
 module.exports=router;

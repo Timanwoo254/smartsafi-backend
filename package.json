@@ -9,7 +9,7 @@
     "start": "node src/server.js & sleep infinity",
     "migrate": "node scripts/migrate.js",
     "dev": "nodemon src/server.js",
-    "devdb": "node scripts/devdb.js",
+    "devdb": "node scripts/devdb.js",c
     "seed": "node scripts/seed.js"
   },
   "dependencies": {
