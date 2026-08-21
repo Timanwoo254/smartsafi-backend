@@ -87,7 +87,7 @@ router.patch('/:id/status',authenticate,ownOrder,async(req,res)=>{
     const r=await query(`UPDATE orders SET status=$1,driver_name=COALESCE($2,driver_name),driver_phone=COALESCE($3,driver_phone),delivery_time=CASE WHEN $1='delivered' THEN NOW() ELSE delivery_time END,updated_at=NOW() WHERE id=$4 RETURNING *`,[status,driverName||null,driverPhone||null,req.params.id]);
     if(!r.rows.length)return res.status(404).json({success:false,message:'Not found'});
     await query('INSERT INTO order_status_history(order_id,status,changed_by,note)VALUES($1,$2,$3,$4)',[req.params.id,status,req.user.id,note||null]);
-    const io=req.app.get('io');if(io)io.to(`order_${req.params.id}`).emit('order_update',{status,ts:new Date()});
+    const io=req.app.get('io');if(io){io.to(`order_${req.params.id}`).emit('order_update',{status,ts:new Date()});io.to(`user_${req.order.user_id}`).emit('order_update',{orderId:req.params.id,status,ts:new Date()});}
     if(status==='delivered'){const{createDisbursement}=require('../commission/commission.service');createDisbursement(req.params.id,req.user.id).catch(e=>console.error('Disbursement:',e.message));}
     res.json({success:true,data:r.rows[0]});
   }catch{res.status(500).json({success:false,message:'Failed'});}

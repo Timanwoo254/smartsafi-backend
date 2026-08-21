@@ -1,16 +1,14 @@
 require('dotenv').config();
-
-const express = require('express');
-const http = require('http');
-const cors = require('cors');
-const helmet = require('helmet');
-const morgan = require('morgan');
-const rateLimit = require('express-rate-limit');
-const { Server } = require('socket.io');
-const cron = require('node-cron');
+const express = require('express'),
+  http = require('http'),
+  cors = require('cors'),
+  helmet = require('helmet'),
+  morgan = require('morgan');
+const rateLimit = require('express-rate-limit'),
+  { Server } = require('socket.io'),
+  cron = require('node-cron');
 const { connectDB } = require('./utils/db');
 
-// Import routes
 const authRoutes = require('./services/auth/auth.routes');
 const laundromatRoutes = require('./services/laundromats/laundromat.routes');
 const orderRoutes = require('./services/orders/order.routes');
@@ -22,23 +20,27 @@ const {
   servicesRouter, scheduleRouter, supportRouter, usersRouter, reviewsRouter,
 } = require('./services/support/misc.routes');
 
-const app = express();
-const server = http.createServer(app);
+const app = express(),
+  server = http.createServer(app);
 
 // Trust Railway's proxy so req.ip / rate-limit / secure cookies work correctly
 app.set('trust proxy', 1);
 
-// Socket.io setup
 const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
 app.set('io', io);
 io.on('connection', (socket) => {
   socket.on('join_order', (orderId) => socket.join(`order_${orderId}`));
   socket.on('leave_order', (orderId) => socket.leave(`order_${orderId}`));
+  // Lets a client stay subscribed to updates for ALL of a user's orders,
+  // regardless of which screen they're currently on -- fixes order status
+  // changes never reaching the customer unless they're actively viewing
+  // that exact order's tracking screen at the moment it changes.
+  socket.on('join_user', (userId) => socket.join(`user_${userId}`));
+  socket.on('leave_user', (userId) => socket.leave(`user_${userId}`));
   socket.on('driver_location', ({ orderId, latitude, longitude }) =>
     io.to(`order_${orderId}`).emit('location_update', { latitude, longitude, ts: Date.now() }));
 });
 
-// Security & middleware
 app.use(helmet({ crossOriginEmbedderPolicy: false, contentSecurityPolicy: false }));
 const origins = process.env.NODE_ENV === 'production'
   ? (process.env.ALLOWED_ORIGINS || '*').split(',').map((o) => o.trim())
@@ -60,13 +62,12 @@ app.use('/api', rateLimit({
   message: { success: false, message: 'Too many requests' },
 }));
 
-// Health checks
+// Health checks — both root and /health respond, so Railway's probe passes either way
 app.get('/', (req, res) => res.json({ status: 'ok', app: 'Smart-Safi API', version: '2.0.0' }));
 app.get('/health', (req, res) => res.json({
   status: 'ok', app: 'Smart-Safi API', version: '2.0.0', ts: new Date().toISOString(),
 }));
 
-// Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/users', usersRouter);
 app.use('/api/services', servicesRouter);
@@ -80,7 +81,6 @@ app.use('/api/earnings', commissionRoutes);
 app.use('/api/reviews', reviewsRouter);
 app.use('/api/admin', adminRoutes);
 
-// Error handlers
 app.use((err, req, res, next) => {
   console.error('Unhandled:', err.message);
   const dev = process.env.NODE_ENV === 'development';
@@ -128,8 +128,7 @@ cron.schedule('0 0 * * *', async () => {
   }
 });
 
-// ── Start server ──
-// ✅ ONLY ONE PORT DECLARATION – using Railway's PORT env or fallback to 5000
+// ── Start server — bind to 0.0.0.0 so Railway's proxy can reach it ──
 const PORT = process.env.PORT || 5000;
 const HOST = '0.0.0.0';
 
@@ -145,7 +144,7 @@ async function start() {
 }
 start();
 
-// Graceful shutdown – respond cleanly to Railway's SIGTERM
+// Graceful shutdown — respond cleanly to Railway's SIGTERM instead of erroring
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down gracefully');
   server.close(() => process.exit(0));
