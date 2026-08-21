@@ -2,7 +2,15 @@ const express=require('express'),router=express.Router();
 const {query,getClient}=require('../../utils/db');
 const {authenticate,requireRole,ownOrder,auditLog}=require('../../middleware/auth.middleware');
 const DELIVERY_FEE=100;
-const TRANSITIONS={confirmed:['picked_up'],picked_up:['washing'],washing:['ironing','ready'],ironing:['ready'],ready:['out_for_delivery'],out_for_delivery:['delivered']};
+
+// Widened so laundromat staff can act on an order the moment it's placed --
+// not just after M-Pesa payment confirms it. Previously only 'confirmed'
+// allowed a transition to 'picked_up', which meant any order still 'pending'
+// (payment not yet completed, OR paid via cash-on-delivery, which has no
+// mechanism to ever become 'confirmed') was permanently stuck: invisible to
+// staff, and even if visibility were fixed alone, blocked with a 400 error
+// the moment staff tried to accept it.
+const TRANSITIONS={pending:['picked_up'],confirmed:['picked_up'],picked_up:['washing'],washing:['ironing','ready'],ironing:['ready'],ready:['out_for_delivery'],out_for_delivery:['delivered']};
 function genOrderNum(){return'SS'+Date.now().toString(36).toUpperCase().slice(-5)+Math.random().toString(36).toUpperCase().slice(2,5);}
 
 router.post('/',authenticate,requireRole('client'),async(req,res)=>{
@@ -33,6 +41,15 @@ router.post('/',authenticate,requireRole('client'),async(req,res)=>{
     await dbClient.query('INSERT INTO order_status_history(order_id,status,changed_by,note)VALUES($1,$2,$3,$4)',[order.id,'pending',req.user.id,'Order placed']);
     await dbClient.query('COMMIT');
     await auditLog(req.user.id,'client','ORDER_CREATED','orders',order.id,req,{total});
+
+    // Push the new order to any laundromat-app clients currently connected,
+    // so staff see it instantly instead of only on their next manual
+    // refresh. This event was never being emitted before -- the client-side
+    // listener in IncomingOrdersScreen existed, but nothing on the backend
+    // ever fired it.
+    const io=req.app.get('io');
+    if(io)io.emit('new_order',{laundromat_id:lmId,order_id:order.id,order_number:order.order_number});
+
     res.status(201).json({success:true,data:order});
   }catch(e){await dbClient.query('ROLLBACK');console.error('Create order:',e.message);res.status(500).json({success:false,message:e.message.includes('not found')?e.message:'Failed to create order'});}
   finally{dbClient.release();}
