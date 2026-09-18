@@ -5,6 +5,41 @@ const jwt=require('jsonwebtoken');
 
 function haversine(la1,lo1,la2,lo2){const R=6371,dL=(la2-la1)*Math.PI/180,dO=(lo2-lo1)*Math.PI/180;const a=Math.sin(dL/2)**2+Math.cos(la1*Math.PI/180)*Math.cos(la2*Math.PI/180)*Math.sin(dO/2)**2;return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));}
 function normalizePhone(phone){let np=phone.replace(/[\s\-()]/g,'');if(np.startsWith('0'))np='+254'+np.slice(1);else if(np.startsWith('254'))np='+'+np;else if(!np.startsWith('+'))np='+254'+np;return np;}
+// Matches the normalization login already applies (express-validator's
+// normalizeEmail: lowercase + trim). Without this, an account created here
+// with any non-lowercase email would silently fail to log in afterward --
+// the login query always normalizes to lowercase before matching, and
+// Postgres string equality is case-sensitive by default.
+function normalizeEmail(email){return String(email).trim().toLowerCase();}
+
+// Validates the laundromat's payout destination. M-Pesa uses two different
+// APIs depending on the destination, so the method has to be captured and
+// stored, not guessed: B2C pays an individual's phone wallet (PartyB is an
+// MSISDN), B2B pays another business's till or paybill (PartyB is a shortcode).
+// Returns {ok:true, value:{...}} or {ok:false, message}.
+function validatePayout({payout_method,payout_number,payout_account_ref,payout_name}){
+  if(!payout_method||!payout_number)
+    return{ok:false,message:'A payout method and number are required so you can be paid'};
+  if(!['mpesa_phone','till','paybill'].includes(payout_method))
+    return{ok:false,message:'Payout method must be mpesa_phone, till or paybill'};
+  let num=String(payout_number).replace(/[\s\-()]/g,'');
+  if(payout_method==='mpesa_phone'){
+    num=normalizePhone(num);
+    if(!/^\+254[17]\d{8}$/.test(num))
+      return{ok:false,message:'Enter a valid Safaricom M-Pesa number, e.g. 0712345678'};
+  }else{
+    if(!/^\d{5,9}$/.test(num))
+      return{ok:false,message:(payout_method==='till'?'Till':'Paybill')+' number must be 5-9 digits'};
+    if(payout_method==='paybill'&&!payout_account_ref)
+      return{ok:false,message:'A paybill account reference is required'};
+  }
+  return{ok:true,value:{
+    payout_method,
+    payout_number:num,
+    payout_account_ref:payout_method==='paybill'?String(payout_account_ref).trim():null,
+    payout_name:payout_name?String(payout_name).trim():null,
+  }};
+}
 
 function buildTree(rows){
   const byId={};
@@ -31,27 +66,32 @@ router.get('/',async(req,res)=>{
 });
 
 router.post('/register', async (req, res) => {
-  const { name, address, area, city, mpesa_till, description, owner_name, email, phone, password } = req.body;
+  const { name, address, area, city, mpesa_till, description, owner_name, email, phone, password,
+          payout_method, payout_number, payout_account_ref, payout_name } = req.body;
   if (!name || !address || !owner_name || !email || !phone || !password)
     return res.status(400).json({ success:false, message:'Business name, address, owner name, email, phone and password are required' });
   if (password.length < 8)
     return res.status(400).json({ success:false, message:'Password must be at least 8 characters' });
+  const payout = validatePayout({payout_method,payout_number,payout_account_ref,payout_name});
+  if(!payout.ok) return res.status(400).json({ success:false, message: payout.message });
   const np = normalizePhone(phone);
+  const nEmail = normalizeEmail(email);
   const client = await getClient();
   try {
     await client.query('BEGIN');
-    const exLm = await client.query('SELECT id FROM laundromats WHERE email=$1 OR phone=$2', [email, np]);
+    const exLm = await client.query('SELECT id FROM laundromats WHERE email=$1 OR phone=$2', [nEmail, np]);
     if (exLm.rows.length) { await client.query('ROLLBACK'); return res.status(409).json({ success:false, message:'A laundromat with this email or phone is already registered' }); }
-    const exUser = await client.query('SELECT id FROM users WHERE email=$1 OR phone=$2', [email, np]);
+    const exUser = await client.query('SELECT id FROM users WHERE email=$1 OR phone=$2', [nEmail, np]);
     if (exUser.rows.length) { await client.query('ROLLBACK'); return res.status(409).json({ success:false, message:'An account with this email or phone already exists' }); }
     const lm = await client.query(
-      "INSERT INTO laundromats(name,owner_name,email,phone,address,area,city,mpesa_till,description,commission_rate,admin_fee_rate,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,15,5,'pending') RETURNING *",
-      [name, owner_name, email, np, address, area||null, city||'Nairobi', mpesa_till||null, description||null]
+      "INSERT INTO laundromats(name,owner_name,email,phone,address,area,city,mpesa_till,description,commission_rate,admin_fee_rate,status,payout_method,payout_number,payout_account_ref,payout_name,payout_verified) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,15,5,'pending',$10,$11,$12,$13,false) RETURNING *",
+      [name, owner_name, nEmail, np, address, area||null, city||'Nairobi', mpesa_till||null, description||null,
+       payout.value.payout_method, payout.value.payout_number, payout.value.payout_account_ref, payout.value.payout_name]
     );
     const hash = await bcrypt.hash(password, 12);
     const ur = await client.query(
       "INSERT INTO users(name,email,phone,password_hash,role) VALUES($1,$2,$3,$4,'laundromat') RETURNING id,name,email,phone,role,token_version",
-      [owner_name.trim(), email, np, hash]
+      [owner_name.trim(), nEmail, np, hash]
     );
     const newUser = ur.rows[0];
     await client.query("INSERT INTO laundromat_users(laundromat_id,user_id,staff_role) VALUES($1,$2,'owner')",[lm.rows[0].id, newUser.id]);
@@ -108,24 +148,25 @@ router.post('/',authenticate,isAdmin,async(req,res)=>{
   const{name,owner_name,email,phone,address,area,city,latitude,longitude,commission_rate=15,admin_fee_rate=5,mpesa_till,description,password}=req.body;
   if(!name||!owner_name||!email||!phone||!address)return res.status(400).json({success:false,message:'Required fields missing'});
   const np=normalizePhone(phone);
+  const nEmail=normalizeEmail(email);
   if(password && password.length<8) return res.status(400).json({success:false,message:'Password must be at least 8 characters'});
   const client = await getClient();
   try{
     await client.query('BEGIN');
-    const exLm = await client.query('SELECT id FROM laundromats WHERE email=$1 OR phone=$2',[email,np]);
+    const exLm = await client.query('SELECT id FROM laundromats WHERE email=$1 OR phone=$2',[nEmail,np]);
     if(exLm.rows.length){ await client.query('ROLLBACK'); return res.status(409).json({success:false,message:'A laundromat with this email or phone already exists'}); }
     if(password){
-      const exUser = await client.query('SELECT id FROM users WHERE email=$1 OR phone=$2',[email,np]);
+      const exUser = await client.query('SELECT id FROM users WHERE email=$1 OR phone=$2',[nEmail,np]);
       if(exUser.rows.length){ await client.query('ROLLBACK'); return res.status(409).json({success:false,message:'A user account with this email or phone already exists'}); }
     }
     const lm = await client.query(
       "INSERT INTO laundromats(name,owner_name,email,phone,address,area,city,latitude,longitude,commission_rate,admin_fee_rate,mpesa_till,description,status)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending')RETURNING *",
-      [name,owner_name,email,np,address,area,city||'Nairobi',latitude,longitude,commission_rate,admin_fee_rate,mpesa_till,description]
+      [name,owner_name,nEmail,np,address,area,city||'Nairobi',latitude,longitude,commission_rate,admin_fee_rate,mpesa_till,description]
     );
     let ownerAccount = null;
     if(password){
       const hash = await bcrypt.hash(password,12);
-      const ur = await client.query("INSERT INTO users(name,email,phone,password_hash,role) VALUES($1,$2,$3,$4,'laundromat') RETURNING id,name,email,phone",[owner_name.trim(),email,np,hash]);
+      const ur = await client.query("INSERT INTO users(name,email,phone,password_hash,role) VALUES($1,$2,$3,$4,'laundromat') RETURNING id,name,email,phone",[owner_name.trim(),nEmail,np,hash]);
       ownerAccount = ur.rows[0];
       await client.query("INSERT INTO laundromat_users(laundromat_id,user_id,staff_role) VALUES($1,$2,'owner')",[lm.rows[0].id, ownerAccount.id]);
     }
@@ -141,6 +182,13 @@ router.post('/',authenticate,isAdmin,async(req,res)=>{
 
 router.patch('/:id',authenticate,isStaff,ownLaundromat,async(req,res)=>{
   const{name,owner_name,address,area,mpesa_till,description,operating_hours}=req.body;
+  // A laundromat must not go live before an admin has verified where its money
+  // will be sent -- otherwise it can take orders it cannot be paid for.
+  if(req.body.status==='active'){
+    const pv=await query('SELECT payout_verified,payout_method FROM laundromats WHERE id=$1',[req.params.id]);
+    if(pv.rows.length&&!pv.rows[0].payout_verified)
+      return res.status(400).json({success:false,message:'Verify this laundromat\'s payout details before approving it'});
+  }
   const ao={};
   if(['admin','superadmin'].includes(req.user.role)){if(req.body.status!==undefined)ao.status=req.body.status;if(req.body.commission_rate!==undefined)ao.commission_rate=req.body.commission_rate;if(req.body.admin_fee_rate!==undefined)ao.admin_fee_rate=req.body.admin_fee_rate;}
   try{
@@ -148,6 +196,32 @@ router.patch('/:id',authenticate,isStaff,ownLaundromat,async(req,res)=>{
     if(!r.rows.length)return res.status(404).json({success:false,message:'Not found'});
     res.json({success:true,data:r.rows[0]});
   }catch{res.status(500).json({success:false,message:'Failed'});}
+});
+
+// Admin confirms the laundromat's payout destination is correct. Kept as an
+// explicit human step because a wrong till or phone number sends money to a
+// stranger's wallet, and M-Pesa payouts are not reversible.
+router.patch('/:id/verify-payout', authenticate, isAdmin, async (req, res) => {
+  const { verified } = req.body;
+  try {
+    const r = await query(
+      `UPDATE laundromats
+          SET payout_verified=$1,
+              payout_verified_at = CASE WHEN $1 THEN NOW() ELSE NULL END,
+              payout_verified_by = CASE WHEN $1 THEN $2::uuid ELSE NULL END,
+              updated_at=NOW()
+        WHERE id=$3
+        RETURNING id,name,payout_method,payout_number,payout_account_ref,payout_verified`,
+      [verified !== false, req.user.id, req.params.id]
+    );
+    if(!r.rows.length) return res.status(404).json({success:false,message:'Not found'});
+    await auditLog(req.user.id, req.user.role, verified!==false?'PAYOUT_VERIFIED':'PAYOUT_UNVERIFIED',
+      'laundromats', req.params.id, req, {payout_method:r.rows[0].payout_method});
+    res.json({success:true,data:r.rows[0]});
+  } catch(e) {
+    console.error('Verify payout:', e.message);
+    res.status(500).json({success:false,message:'Failed to update payout verification'});
+  }
 });
 
 router.delete('/:id', authenticate, isAdmin, async (req, res) => {
@@ -227,12 +301,13 @@ router.post('/:laundromat_id/staff/invite', authenticate, isStaff, ownLaundromat
   if (!['staff', 'manager', 'owner'].includes(staff_role)) return res.status(400).json({ success: false, message: 'Invalid staff role' });
   if (password.length < 8) return res.status(400).json({ success: false, message: 'Password must be at least 8 characters' });
   const np = normalizePhone(phone);
+  const nEmail = normalizeEmail(email);
   try {
     await client.query('BEGIN');
-    const ex = await client.query('SELECT id FROM users WHERE email=$1 OR phone=$2', [email, np]);
+    const ex = await client.query('SELECT id FROM users WHERE email=$1 OR phone=$2', [nEmail, np]);
     if (ex.rows.length) { await client.query('ROLLBACK'); return res.status(409).json({ success: false, message: 'A user with this email or phone already exists' }); }
     const hash = await bcrypt.hash(password, 12);
-    const ur = await client.query("INSERT INTO users(name,email,phone,password_hash,role) VALUES($1,$2,$3,$4,'laundromat') RETURNING id,name,email,phone",[name.trim(), email, np, hash]);
+    const ur = await client.query("INSERT INTO users(name,email,phone,password_hash,role) VALUES($1,$2,$3,$4,'laundromat') RETURNING id,name,email,phone",[name.trim(), nEmail, np, hash]);
     const newUser = ur.rows[0];
     const lr = await client.query("INSERT INTO laundromat_users(laundromat_id,user_id,staff_role) VALUES($1,$2,$3) RETURNING id,staff_role,is_active,created_at",[req.params.laundromat_id, newUser.id, staff_role]);
     await client.query('COMMIT');
