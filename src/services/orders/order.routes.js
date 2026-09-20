@@ -33,7 +33,10 @@ router.post('/',authenticate,requireRole('client'),async(req,res)=>{
     const orderItems=items.map(item=>{const svc=svcMap[item.serviceId];if(!svc)throw new Error(`Service ${item.serviceId} not found`);const lt=parseFloat((svc.price_per_unit*item.quantity).toFixed(2));subtotal+=lt;return{...item,serviceName:svc.name,unitPrice:svc.price_per_unit,lineTotal:lt};});
     subtotal=parseFloat(subtotal.toFixed(2));
     const feeAmt=parseFloat((subtotal*commRate/100).toFixed(2));
-    const total=parseFloat((subtotal+DELIVERY_FEE).toFixed(2));
+    // MODEL B: the 15% is charged to the CUSTOMER as a visible service fee on
+    // top of the laundromat's own price. The laundromat is then paid their full
+    // listed price. This total must equal the client app's getClientTotal().
+    const total=parseFloat((subtotal+feeAmt+DELIVERY_FEE).toFixed(2));
     const oNum=genOrderNum();
     const or=await dbClient.query('INSERT INTO orders(order_number,user_id,laundromat_id,pickup_address_id,delivery_address_id,pickup_time,subtotal,platform_fee_pct,platform_fee_amount,delivery_fee,total_amount,special_instructions,idempotency_key)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)RETURNING *',[oNum,req.user.id,lmId,pickupAddressId,deliveryAddressId||pickupAddressId,pickupTime,subtotal,commRate,feeAmt,DELIVERY_FEE,total,specialInstructions||null,idempotencyKey||null]);
     const order=or.rows[0];

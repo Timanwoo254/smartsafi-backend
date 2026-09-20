@@ -28,34 +28,87 @@ async function createDisbursement(orderId,triggeredBy=null){
   const client=await getClient();
   try{
     await client.query('BEGIN');
-    const or=await client.query('SELECT o.id,o.order_number,o.subtotal,o.user_id,o.laundromat_id,o.platform_fee_pct,l.commission_rate,l.mpesa_till,l.name AS lm_name FROM orders o JOIN laundromats l ON l.id=o.laundromat_id WHERE o.id=$1 FOR UPDATE',[orderId]);
+    const or=await client.query('SELECT o.id,o.order_number,o.subtotal,o.user_id,o.laundromat_id,o.platform_fee_pct,o.platform_fee_amount,l.commission_rate,l.mpesa_till,l.name AS lm_name FROM orders o JOIN laundromats l ON l.id=o.laundromat_id WHERE o.id=$1 FOR UPDATE',[orderId]);
     if(!or.rows.length)throw new Error('Order not found');
     const o=or.rows[0];
     const ex=await client.query('SELECT id FROM disbursements WHERE order_id=$1',[orderId]);
     if(ex.rows.length){await client.query('ROLLBACK');return null;}
     const gross=parseFloat(o.subtotal),rate=parseFloat(o.platform_fee_pct||o.commission_rate||15);
-    const comm=parseFloat((gross*rate/100).toFixed(2)),payout=parseFloat((gross-comm).toFixed(2));
+    // MODEL B: the commission was already collected FROM THE CUSTOMER as a
+    // service fee on top of the order. It is not deducted from the laundromat,
+    // so the payout is the laundromat's full listed price. commission_amount is
+    // recorded for reporting only -- it never reduces payout_amount.
+    const comm=parseFloat((o.platform_fee_amount!=null?parseFloat(o.platform_fee_amount):gross*rate/100).toFixed(2));
+    const payout=parseFloat(gross.toFixed(2));
     const dr=await client.query('INSERT INTO disbursements(order_id,laundromat_id,gross_amount,commission_rate,commission_amount,payout_amount,status)VALUES($1,$2,$3,$4,$5,$6,$7)RETURNING *',[orderId,o.laundromat_id,gross,rate,comm,payout,'pending']);
     await client.query('COMMIT');
     console.log(`Disbursement: order=${o.order_number} gross=${gross} comm=${comm} payout=${payout}`);
-    if(o.mpesa_till)executePayout(dr.rows[0].id).catch(e=>console.error('Payout:',e.message));
-    else await query("UPDATE disbursements SET status='on_hold',failure_reason='No M-Pesa till' WHERE id=$1",[dr.rows[0].id]);
+    executePayout(dr.rows[0].id).catch(e=>console.error('Payout:',e.message));
     return dr.rows[0];
   }catch(e){await client.query('ROLLBACK');throw e;}
   finally{client.release();}
 }
 
 async function executePayout(disbId){
-  const r=await query('SELECT d.*,l.mpesa_till,l.name FROM disbursements d JOIN laundromats l ON l.id=d.laundromat_id WHERE d.id=$1',[disbId]);
+  const r=await query(`SELECT d.*, l.name, l.mpesa_till,
+                              l.payout_method, l.payout_number, l.payout_account_ref, l.payout_verified
+                       FROM disbursements d JOIN laundromats l ON l.id=d.laundromat_id
+                       WHERE d.id=$1`,[disbId]);
   if(!r.rows.length)return;
   const d=r.rows[0];
+
+  // Never send money to an unchecked destination. A wrong till or phone number
+  // means the payout lands in a stranger's wallet and is not recoverable, so a
+  // human has to have verified it first.
+  if(!d.payout_verified||!d.payout_method||!d.payout_number){
+    await query("UPDATE disbursements SET status='on_hold',failure_reason=$1 WHERE id=$2",
+      ['Payout destination not verified by admin',d.id]);
+    console.warn(`Payout held: ${d.name} has no verified payout destination`);
+    return;
+  }
+
   await query("UPDATE disbursements SET status='processing',initiated_at=NOW() WHERE id=$1",[d.id]);
   try{
     const token=await getMpesaToken();
     const base=process.env.MPESA_ENV==='production'?'https://api.safaricom.co.ke':'https://sandbox.safaricom.co.ke';
-    const res=await axios.post(`${base}/mpesa/b2c/v3/paymentrequest`,{InitiatorName:cleanEnv(process.env.MPESA_INITIATOR_NAME),SecurityCredential:cleanEnv(process.env.MPESA_SECURITY_CREDENTIAL),CommandID:'BusinessPayment',Amount:Math.floor(d.payout_amount),PartyA:cleanEnv(process.env.MPESA_SHORTCODE),PartyB:d.mpesa_till,Remarks:`SmartSafi payout ${d.order_id}`,QueueTimeOutURL:cleanEnv(process.env.MPESA_B2C_TIMEOUT_URL),ResultURL:cleanEnv(process.env.MPESA_B2C_RESULT_URL),Occasion:d.id},{headers:{Authorization:`Bearer ${token}`}});
+    const shortcode=cleanEnv(process.env.MPESA_SHORTCODE);
+    const common={
+      InitiatorName:cleanEnv(process.env.MPESA_INITIATOR_NAME),
+      SecurityCredential:cleanEnv(process.env.MPESA_SECURITY_CREDENTIAL),
+      Amount:Math.floor(d.payout_amount),
+      PartyA:shortcode,
+      Remarks:`SmartSafi payout ${d.order_id}`,
+      QueueTimeOutURL:cleanEnv(process.env.MPESA_B2C_TIMEOUT_URL),
+      ResultURL:cleanEnv(process.env.MPESA_B2C_RESULT_URL),
+    };
+
+    let url,payload;
+    if(d.payout_method==='mpesa_phone'){
+      // B2C: pays an individual's M-Pesa wallet. PartyB must be an MSISDN in
+      // 2547XXXXXXXX form (no leading +).
+      url=`${base}/mpesa/b2c/v3/paymentrequest`;
+      payload={...common,CommandID:'BusinessPayment',PartyB:String(d.payout_number).replace(/^\+/,''),Occasion:d.id};
+    }else{
+      // B2B: pays another BUSINESS's till or paybill. Different endpoint and a
+      // different CommandID -- sending a till through the B2C endpoint fails.
+      url=`${base}/mpesa/b2b/v1/paymentrequest`;
+      payload={...common,
+        CommandID:d.payout_method==='paybill'?'BusinessPayBill':'BusinessBuyGoods',
+        SenderIdentifierType:'4',
+        RecieverIdentifierType:'4',
+        PartyB:String(d.payout_number),
+        AccountReference:d.payout_account_ref||d.order_id,
+      };
+    }
+
+    const res=await axios.post(url,payload,{headers:{Authorization:`Bearer ${token}`}});
     await query('UPDATE disbursements SET mpesa_reference=$1 WHERE id=$2',[res.data.ConversationID,d.id]);
-  }catch(e){await query("UPDATE disbursements SET status='failed',failure_reason=$1 WHERE id=$2",[(e.response?.data?.errorMessage||e.message).substring(0,200),d.id]);}
+    console.log(`Payout sent via ${d.payout_method}: ${d.name} KES${Math.floor(d.payout_amount)}`);
+  }catch(e){
+    await query("UPDATE disbursements SET status='failed',failure_reason=$1 WHERE id=$2",
+      [(e.response?.data?.errorMessage||e.message).substring(0,200),d.id]);
+    console.error('Payout failed:',e.response?.data||e.message);
+  }
 }
 
 async function handleB2CResult(req,res){
