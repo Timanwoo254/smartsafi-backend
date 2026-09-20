@@ -73,8 +73,4 @@ router.get('/audit-log',async(req,res)=>{
   try{const r=await query('SELECT a.*,u.name AS actor_name FROM audit_log a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.created_at DESC LIMIT $1 OFFSET $2',[limit,offset]);res.json({success:true,data:r.rows});}
   catch{res.status(500).json({success:false,message:'Failed'});}
 });
-router.get('/subscriptions',async(req,res)=>{
-  try{const{listAll}=require('../subscriptions/subscription.service');res.json({success:true,data:await listAll()});}
-  catch{res.status(500).json({success:false,message:'Failed'});}
-});
 module.exports=router;

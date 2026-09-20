@@ -1,6 +1,6 @@
 const express=require('express'),router=express.Router(),bcrypt=require('bcryptjs'),jwt=require('jsonwebtoken');
 const {body,validationResult}=require('express-validator'),rateLimit=require('express-rate-limit');
-const {query,getClient}=require('../../utils/db'),{authenticate,auditLog}=require('../../middleware/auth.middleware');
+const {query}=require('../../utils/db'),{authenticate,auditLog}=require('../../middleware/auth.middleware');
 const authLimiter=rateLimit({windowMs:15*60*1000,max:5,skipSuccessfulRequests:true,message:{success:false,message:'Too many attempts'}});
 async function generateToken(user){
   let lm=null;
@@ -20,30 +20,6 @@ router.post('/register',authLimiter,[body('name').trim().notEmpty(),body('email'
     await auditLog(u.id,'client','REGISTER','users',u.id,req);
     res.status(201).json({success:true,data:{user:{id:u.id,name:u.name,email:u.email,phone:u.phone,role:u.role},token}});
   }catch(e){console.error('Register:',e.message);res.status(500).json({success:false,message:'Registration failed'});}
-});
-// Laundromat partner self sign-up: creates a laundromat-role user + a pending laundromat (awaiting admin approval) + owner link, atomically.
-router.post('/register-laundromat',authLimiter,[body('name').trim().notEmpty(),body('businessName').trim().notEmpty(),body('email').isEmail().normalizeEmail(),body('phone').notEmpty(),body('password').isLength({min:8}),body('address').trim().notEmpty()],async(req,res)=>{
-  const errors=validationResult(req);if(!errors.isEmpty())return res.status(400).json({success:false,message:errors.array()[0].msg});
-  const{name,businessName,email,phone,password,address,area}=req.body,nPhone=normalizePhone(phone);
-  const client=await getClient();
-  try{
-    await client.query('BEGIN');
-    const exU=await client.query('SELECT id FROM users WHERE email=$1 OR phone=$2',[email,nPhone]);
-    if(exU.rows.length){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'Email or phone already registered'});}
-    const exL=await client.query('SELECT id FROM laundromats WHERE email=$1 OR phone=$2',[email,nPhone]);
-    if(exL.rows.length){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'A laundromat with this email or phone already exists'});}
-    const hash=await bcrypt.hash(password,12);
-    const ur=await client.query('INSERT INTO users(name,email,phone,password_hash,role)VALUES($1,$2,$3,$4,$5)RETURNING id,name,email,phone,role,token_version',[name.trim(),email,nPhone,hash,'laundromat']);
-    const u=ur.rows[0];
-    const lr=await client.query('INSERT INTO laundromats(name,owner_name,email,phone,address,area,status)VALUES($1,$2,$3,$4,$5,$6,$7)RETURNING id,name,status,commission_rate,admin_fee_rate',[businessName.trim(),name.trim(),email,nPhone,address.trim(),area?.trim()||null,'pending']);
-    const lm=lr.rows[0];
-    await client.query('INSERT INTO laundromat_users(laundromat_id,user_id,staff_role)VALUES($1,$2,$3)',[lm.id,u.id,'owner']);
-    await client.query('COMMIT');
-    const token=await generateToken(u);
-    await auditLog(u.id,'laundromat','REGISTER','laundromats',lm.id,req);
-    res.status(201).json({success:true,data:{user:{id:u.id,name:u.name,email:u.email,phone:u.phone,role:u.role},laundromat:lm,token}});
-  }catch(e){await client.query('ROLLBACK').catch(()=>{});console.error('Register-laundromat:',e.message);res.status(500).json({success:false,message:'Registration failed'});}
-  finally{client.release();}
 });
 router.post('/login',authLimiter,[body('email').isEmail().normalizeEmail(),body('password').notEmpty()],async(req,res)=>{
   const errors=validationResult(req);if(!errors.isEmpty())return res.status(400).json({success:false,message:'Invalid credentials'});
